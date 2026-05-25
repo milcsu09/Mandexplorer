@@ -1,0 +1,93 @@
+#ifndef COMMON_H
+#define COMMON_H
+
+
+#include <inttypes.h>
+#include <math.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+typedef uint8_t u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+
+typedef int8_t i8;
+typedef int16_t i16;
+typedef int32_t i32;
+typedef int64_t i64;
+
+typedef size_t usize;
+
+
+typedef float f32;
+typedef double f64;
+
+
+// // NOTE: `long double` does not guarantee 80 bits.
+// typedef long double f80;
+
+
+#define F32_E        2.7182818284590452354f
+#define F32_LOG2E    1.4426950408889634074f
+#define F32_LOG10E   0.43429448190325182765f
+#define F32_LN2      0.69314718055994530942f
+#define F32_LN10     2.30258509299404568402f
+#define F32_PI       3.14159265358979323846f
+#define F32_PI_2     1.57079632679489661923f
+#define F32_PI_4     0.78539816339744830962f
+#define F32_SQRT2    1.41421356237309504880f
+#define F32_SQRT1_2  0.70710678118654752440f
+
+#define F32_DEG2RAD F32_PI / 180.0f
+#define F32_RAD2DEG 180.0f / F32_PI
+
+
+#define F64_E        2.7182818284590452354
+#define F64_LOG2E    1.4426950408889634074
+#define F64_LOG10E   0.43429448190325182765
+#define F64_LN2      0.69314718055994530942
+#define F64_LN10     2.30258509299404568402
+#define F64_PI       3.14159265358979323846
+#define F64_PI_2     1.57079632679489661923
+#define F64_PI_4     0.78539816339744830962
+#define F64_SQRT2    1.41421356237309504880
+#define F64_SQRT1_2  0.70710678118654752440
+
+#define F64_DEG2RAD F64_PI / 180.0
+#define F64_RAD2DEG 180.0 / F64_PI
+
+
+// #define F80_E       2.718281828459045235360287471352662498L
+// #define F80_LOG2E   1.442695040888963407359924681001892137L
+// #define F80_LOG10E  0.434294481903251827651128918916605082L
+// #define F80_LN2     0.693147180559945309417232121458176568L
+// #define F80_LN10    2.302585092994045684017991454684364208L
+// #define F80_PI      3.141592653589793238462643383279502884L
+// #define F80_PI_2    1.570796326794896619231321691639751442L
+// #define F80_PI_4    0.785398163397448309615660845819875721L
+// #define F80_SQRT2   1.414213562373095048801688724209698079L
+// #define F80_SQRT1_2 0.707106781186547524400844362104849039L
+// 
+// #define F80_DEG2RAD F80_PI / 180.0L
+// #define F80_RAD2DEG 180.0L / F80_PI
+
+
+void *
+malloc0 (usize size);
+
+
+i64
+imin (i64 a, i64 b);
+
+i64
+imax (i64 a, i64 b);
+
+
+#endif // COMMON_H
+

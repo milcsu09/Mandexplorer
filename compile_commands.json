@@ -1,0 +1,107 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-O3",
+      "-oa",
+      "src/color.c"
+    ],
+    "directory": "/home/pmilan/Programming/c/fraz",
+    "file": "/home/pmilan/Programming/c/fraz/src/color.c"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-O3",
+      "-oa",
+      "src/common.c"
+    ],
+    "directory": "/home/pmilan/Programming/c/fraz",
+    "file": "/home/pmilan/Programming/c/fraz/src/common.c"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-O3",
+      "-oa",
+      "src/image.c"
+    ],
+    "directory": "/home/pmilan/Programming/c/fraz",
+    "file": "/home/pmilan/Programming/c/fraz/src/image.c"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-O3",
+      "-oa",
+      "src/main.c"
+    ],
+    "directory": "/home/pmilan/Programming/c/fraz",
+    "file": "/home/pmilan/Programming/c/fraz/src/main.c"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-O3",
+      "-oa",
+      "src/palette.c"
+    ],
+    "directory": "/home/pmilan/Programming/c/fraz",
+    "file": "/home/pmilan/Programming/c/fraz/src/palette.c"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-O3",
+      "-oa",
+      "src/scene.c"
+    ],
+    "directory": "/home/pmilan/Programming/c/fraz",
+    "file": "/home/pmilan/Programming/c/fraz/src/scene.c"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-c",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-O3",
+      "-oa",
+      "src/thread_pool.c"
+    ],
+    "directory": "/home/pmilan/Programming/c/fraz",
+    "file": "/home/pmilan/Programming/c/fraz/src/thread_pool.c"
+  }
+]
