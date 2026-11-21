@@ -164,8 +164,6 @@ static usize render_pixels_cap = 0;
 // upload s.image while the GPU job is still writing it, and in vibe mode it
 // must not wait for that job either: it keeps showing the last complete frame.
 static _Atomic bool gpu_job_active;
-static _Atomic bool gpu_vibe_done;
-static _Atomic bool gpu_vibe_inflight;
 
 static usize *render_counts = NULL;
 static usize render_counts_cap = 0;
@@ -279,8 +277,6 @@ terminate (void)
   thread_pool_wait (s.pool);
 
   atomic_store (&gpu_job_active, false);
-  atomic_store (&gpu_vibe_done, false);
-  atomic_store (&gpu_vibe_inflight, false);
 
   s.phase = PHASE_IDLE;
 
@@ -527,14 +523,9 @@ struct gpu_job_args
 {
   struct gpu_view view;
   i32 generation;
-  struct image *out;
-  bool vibe;
 };
 
 static struct gpu_job_args gpu_job_args;
-static struct gpu_job_args gpu_vibe_job_args;
-
-static struct image *gpu_vibe_image = NULL;
 
 static void
 gpu_job (void *argument)
@@ -544,22 +535,19 @@ gpu_job (void *argument)
   const bool current = args->generation == atomic_load (&s.generation);
 
   if (current)
-    gpu_render_mandelbrot (&args->view, args->out ? args->out : s.image);
+    gpu_render_mandelbrot (&args->view, s.image);
 
-  if (args->vibe)
-    atomic_store (&gpu_vibe_inflight, false);
-  else
-    atomic_store (&gpu_job_active, false);
+  // Publish "the image is no longer being written" before claiming the
+  // result.  The display may then upload it without waiting for another
+  // frame; the reverse order would let PHASE_COMPUTE_IMAGE set redraw while
+  // the upload is still suppressed by gpu_job_active.
+  atomic_store (&gpu_job_active, false);
 
+  // A newer view may have been requested while the kernel was running.
+  // Do not claim the result in that case; terminate() has already reset
+  // tiles_done and the next render owns the image.
   if (current && args->generation == atomic_load (&s.generation))
-    {
-      if (args->vibe)
-        {
-          atomic_store (&gpu_vibe_done, true);
-        }
-      else
-        atomic_store (&s.tiles_done, n_tiles ());
-    }
+    atomic_store (&s.tiles_done, n_tiles ());
 }
 
 
@@ -2021,8 +2009,6 @@ main (i32 argc, char **argv)
 
   s.image = image_create (s.w, s.h);
 
-  gpu_vibe_image = image_create (s.w, s.h);
-
   keyframe_image = image_create (s.w, s.h);
 
   s.orbit_re = calloc (s.scene->iter_max + 1, sizeof (f64));
@@ -2441,10 +2427,6 @@ main (i32 argc, char **argv)
                 image_destroy (s.image);
 
                 s.image = image_create (s.w, s.h);
-
-                if (gpu_vibe_image)
-                  image_destroy (gpu_vibe_image);
-                gpu_vibe_image = image_create (s.w, s.h);
 
                 if (keyframe_image)
                   {
@@ -2931,50 +2913,6 @@ main (i32 argc, char **argv)
                 }
 
             }
-              // In vibe mode, also kick off a background GPU render into a
-              // separate buffer.  When it completes, its sharp result replaces
-              // the partial CPU circle.
-              if (vibe && !gpu_vibe_inflight)
-                {
-                  struct gpu_view gv;
-                  gv.c_re = s.center_re;
-                  gv.c_im = s.center_im;
-                  gv.width = s.scene->width;
-                  gv.iter_max = s.scene->iter_max;
-                  gv.iter_per_color = s.scene->iter_per_color;
-                  gv.ss = s.render_ss;
-                  gv.formula = s.formula;
-                  gv.omni_a = s.omni_a;
-                  gv.bailout = s.scene->bailout;
-                  gv.lx = s.scene->lx;
-                  gv.ly = s.scene->ly;
-                  gv.lz = s.scene->lz;
-                  gv.color_inside = color_inside;
-                  gv.w = s.w;
-                  gv.h = s.h;
-                  gv.palette = s.palette;
-                  gv.orbit_re = s.orbit_re;
-                  gv.orbit_im = s.orbit_im;
-                  gv.delta_c_re = delta_c_re;
-                  gv.delta_c_im = delta_c_im;
-                  gv.period_tol = period_tol;
-
-                  gpu_vibe_job_args.view = gv;
-                  gpu_vibe_job_args.generation = s.work_generation;
-                  gpu_vibe_job_args.out = gpu_vibe_image;
-                  gpu_vibe_job_args.vibe = true;
-
-                  atomic_store (&gpu_vibe_inflight, true);
-                  atomic_store (&gpu_vibe_done, false);
-
-                  if (thread_pool_enqueue (s.pool, gpu_job, &gpu_vibe_job_args) != 0)
-                    {
-                      atomic_store (&gpu_vibe_inflight, false);
-                      gpu_render_mandelbrot (&gv, gpu_vibe_image);
-                      atomic_store (&gpu_vibe_done, true);
-                    }
-                }
-
           break;
 
         case PHASE_COMPUTE_IMAGE:
@@ -2991,9 +2929,6 @@ main (i32 argc, char **argv)
                 {
                   auto_iter_update (compute_image_total, vibe);
                   s.phase = PHASE_IDLE;
-
-                  if (vibe)
-                    s.redraw = true;
 
                   break;
                 }
@@ -3068,24 +3003,6 @@ main (i32 argc, char **argv)
 
               printf ("Recording render finished: %zu frames -> '%s'\n",
                       recorded_count, video_path);
-            }
-        }
-
-      // If the background GPU render in vibe mode has finished, adopt its
-      // sharp result.
-      if (vibe && atomic_load (&gpu_vibe_done))
-        {
-          atomic_store (&gpu_vibe_done, false);
-          // Only adopt the GPU frame while the accumulated zoom is small,
-          // otherwise the commit (baking many frames of zoom at once) causes
-          // a visible jerk at the seam.  A stale GPU frame is discarded.
-          if (s.scale < 1.3)
-            {
-              terminate ();
-              for (i32 y = 0; y < s.image->h; ++y)
-                for (i32 x = 0; x < s.image->w; ++x)
-                  image_set2 (s.image, x, y, image_get2 (gpu_vibe_image, x, y));
-              s.redraw = true;
             }
         }
 
@@ -3283,9 +3200,6 @@ main (i32 argc, char **argv)
 
   if (keyframe_image)
     image_destroy (keyframe_image);
-
-  if (gpu_vibe_image)
-    image_destroy (gpu_vibe_image);
 
   image_destroy (s.image);
 
