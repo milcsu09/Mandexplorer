@@ -1071,6 +1071,16 @@ auto_state_name (enum auto_iter_state state)
 }
 
 
+// When rendering a recorded video, carry any adaptive iter_max adjustment
+// back into the frame's view state.  Otherwise the next-frame setup would
+// immediately restore the captured N and the controller could never help.
+static void
+persist_video_iter (void)
+{
+  if (!rendering_video || render_index >= recorded_count) return;
+  recorded_views[render_index].iter_max = s.scene->iter_max;
+}
+
 static void
 auto_iter_update (u64 render_ms, bool vibe)
 {
@@ -2674,9 +2684,10 @@ main (i32 argc, char **argv)
               s.center_re = v->c_re;
               s.center_im = v->c_im;
 
-              auto_iter = false;
-              auto_state = AUTO_OFF;
-
+              // Keep adaptive iterations active while rendering video: they
+              // are exactly what keeps deep frames from blowing up the
+              // per-frame budget.  The fitted N below is only a starting
+              // point; auto_iter_update may refine it after each frame.
               s.redraw = true;
               video_frame_pending = true;
               keyframe_pending = true;
@@ -3003,6 +3014,7 @@ main (i32 argc, char **argv)
               if (!can_probe)
                 {
                   auto_iter_update (compute_image_total, vibe);
+                  persist_video_iter ();
                   s.phase = PHASE_IDLE;
 
                   if (vibe)
@@ -3021,6 +3033,7 @@ main (i32 argc, char **argv)
               else
                 {
                   auto_iter_update (compute_image_total, vibe);
+                  persist_video_iter ();
                   s.phase = PHASE_IDLE;
                 }
             }
@@ -3030,6 +3043,7 @@ main (i32 argc, char **argv)
           if (atomic_load (&probe_done))
             {
               auto_iter_update (compute_image_total, vibe);
+              persist_video_iter ();
 
               s.phase = PHASE_IDLE;
             }
