@@ -299,7 +299,7 @@ fn render_rows(job: Job&, y0: i64, count: i64) -> u32[] {
                     let fx = (x as f64) + (sx as f64 + 0.5) / (ss as f64);
                     let fy = (y as f64) + (sy as f64 + 0.5) / (ss as f64);
                     let dx = (fx - (job.w as f64) / 2.0) * job.width / (job.w as f64);
-                    let dy = (fy - (job.h as f64) / 2.0) * job.width / (job.w as f64);
+                    let dy = ((job.h as f64) / 2.0 - fy) * job.width / (job.w as f64);
                     let col = pixel_color(pa, dx, dy);
                     r += (col >> 16) & 0xFF;
                     g += (col >> 8) & 0xFF;
@@ -419,8 +419,9 @@ fn dispatch_render(app: AppState&) {
     // transform. Remember both so the transform can be rebased when the frame
     // completes; do not touch c.. or disp here, otherwise the last complete
     // frame would jump on screen.
-    app.pend_re = app.c_re + app.disp_pan_x * app.view_width;
-    app.pend_im = app.c_im - app.disp_pan_y * app.view_width;
+    let w = app.w as f64;
+    app.pend_re = app.c_re + app.disp_pan_x * app.view_width / w;
+    app.pend_im = app.c_im - app.disp_pan_y * app.view_width / w;
     app.pend_width = app.view_width / app.disp_scale;
     app.pend_valid = true;
     app.snap_scale = app.disp_scale;
@@ -454,8 +455,9 @@ fn dispatch_render(app: AppState&) {
 // reset it, so the freshly completed frame and the display agree exactly.
 fn commit_transform(app: AppState&) {
     app.pend_valid = false;
-    app.c_re += app.disp_pan_x * app.view_width;
-    app.c_im -= app.disp_pan_y * app.view_width;
+    let w = app.w as f64;
+    app.c_re += app.disp_pan_x * app.view_width / w;
+    app.c_im -= app.disp_pan_y * app.view_width / w;
     app.view_width /= app.disp_scale;
     app.disp_scale = 1.0;
     app.disp_pan_x = 0.0;
@@ -696,13 +698,13 @@ fn main() {
         // ---- vibe zoom: transform the last complete frame, never block ----
         if app.vibe {
             let mp = gfx::mouse_pos();
-            let u = mp.x as f64 / (app.w as f64);
-            let v = mp.y as f64 / (app.h as f64);
-            let wx = (u - 0.5) / app.disp_scale + app.disp_pan_x;
-            let wy = (v - 0.5) / app.disp_scale + app.disp_pan_y;
+            let sx = mp.x as f64 - (app.w as f64) / 2.0;
+            let sy = mp.y as f64 - (app.h as f64) / 2.0;
+            let wx = sx / app.disp_scale + app.disp_pan_x;
+            let wy = sy / app.disp_scale + app.disp_pan_y;
             app.disp_scale *= 1.02;
-            app.disp_pan_x = wx - (u - 0.5) / app.disp_scale;
-            app.disp_pan_y = wy - (v - 0.5) / app.disp_scale;
+            app.disp_pan_x = wx - sx / app.disp_scale;
+            app.disp_pan_y = wy - sy / app.disp_scale;
         }
 
         if app.need_redraw && !app.rendering { dispatch_render(app); }
@@ -735,7 +737,11 @@ fn main() {
         gfx::begin_screen(float4 { 0.0, 0.0, 0.0, 1.0 });
         gfx::bind(quad_pipeline);
         gfx::bind_texture(gfx::FRAGMENT, 0, app.tex, nearest);
-        gfx::uniforms(gfx::FRAGMENT, 0, ViewP { p: float4 { app.disp_scale as f32, app.disp_pan_x as f32, app.disp_pan_y as f32, 0.0 as f32 } });
+        gfx::uniforms(gfx::FRAGMENT, 0, ViewP { p: float4 {
+            app.disp_scale as f32,
+            (app.disp_pan_x / (app.w as f64)) as f32,
+            (app.disp_pan_y / (app.h as f64)) as f32,
+            0.0 as f32 } });
         gfx::bind_vertex_buffer(qvb);
         gfx::draw(3);
         gfx::end_pass();
