@@ -13,6 +13,24 @@ struct ViewP { p: float4 }
 
 const LN2: f64 = 0.6931471805599453;
 
+// Adaptive iteration control — 1:1 port of the C controller.
+const AUTO_BUDGET_MS: f64 = 6000.0;
+const AUTO_TARGET_MS: f64 = 4000.0;
+const AUTO_HARD_MS: f64 = 60000.0;
+const AUTO_SENSITIVITY_LO: f64 = 0.005;
+const AUTO_SENSITIVITY_HI: f64 = 0.020;
+const AUTO_DEEP_WIDTH: f64 = 1e-12;
+const MAX_ITER_MAX: u64 = 16777216;
+const PROBE_COLS: i64 = 64;
+const PROBE_ROWS: i64 = 48;
+const PROBE_DEADLINE_MS: f64 = 200.0;
+const PROBE_MIN_SAMPLES: i64 = 512;
+
+// auto_state values (AUTO_OFF, AUTO_HOLD, ... AUTO_VIBE).
+const AS_OFF: i32 = 0; const AS_HOLD: i32 = 1; const AS_GROW: i32 = 2;
+const AS_CONVERGED: i32 = 3; const AS_BUDGET: i32 = 4; const AS_RESCUE: i32 = 5;
+const AS_DEEP: i32 = 6; const AS_VIBE: i32 = 7;
+
 const FORMULA_MANDEL: i32 = 0;
 const FORMULA_OMNI: i32 = 1;
 
@@ -28,6 +46,7 @@ struct Job {
     color_inside: i32,
     row_start: i64, row_count: i64,
     indices: i32[],
+    is_probe: bool, probe_iter2: u64,
     mouse_cx: i64, mouse_cy: i64, vibe_render: bool,
     delta_c_re: f64, delta_c_im: f64, period_tol: f64,
     palette_size: i64, palette_data: u32[],
@@ -38,6 +57,7 @@ struct Job {
 // The main thread scatters them into the displayed image so the fresh
 // pixels expand as a circle around the cursor (as in the original C build).
 struct PixResult { gen: u64, indices: i32[], colors: u32[] }
+struct ProbeResult { gen: u64, changed: i64, total: i64 }
 struct RowJob { y: i64, cnt: i64, r2: f64 }
 
 root struct AppState {
@@ -64,6 +84,9 @@ root struct AppState {
     mouse_cx: i64, mouse_cy: i64, vibe_since_dispatch: i64,
     show_info: bool, show_help: bool,
     auto_iter: bool, auto_state: i32, auto_deep_zoom: bool, vibe: bool,
+    auto_render_ms: f64, auto_sensitivity: f64,
+    probe_changed: i64, probe_total: i64, probe_pending: bool, probe_width: f64,
+    render_start: f64, last_render_ms: f64,
     period_tol: f64, recording: bool,
     tex: gfx::Texture, worker_ids: i64[>..]
 }
@@ -273,6 +296,168 @@ fn pixel_color(app: AppState&, dx: f64, dy: f64) -> u32 {
 // Render a job's rows, but walk the pixels in increasing distance from the
 // mouse and stream them back in small batches.  The display thread scatters
 // each batch into the visible image, producing the expanding circle.
+fn auto_state_name(st: i32) -> u8[:] {
+    if st == AS_OFF { return "off"; }
+    if st == AS_HOLD { return "hold"; }
+    if st == AS_GROW { return "grow"; }
+    if st == AS_CONVERGED { return "converged"; }
+    if st == AS_BUDGET { return "budget"; }
+    if st == AS_RESCUE { return "rescue"; }
+    if st == AS_DEEP { return "deep-zoom"; }
+    if st == AS_VIBE { return "vibe"; }
+    return "hold";
+}
+
+fn probe_known_interior(x: f64, y: f64) -> bool {
+    let dx = x + 1.0;
+    if dx * dx + y * y <= 1.0 / 16.0 { return true; }
+    let qx = x - 0.25;
+    let q = qx * qx + y * y;
+    if q * (q + qx) <= y * y / 4.0 { return true; }
+    return false;
+}
+
+// Returns (escaped, nu).  Same plain-f64 iteration as the C probe — the
+// perturbation orbit is deliberately not used here.
+fn probe_mandel(cre: f64, cim: f64, max_iter: u64, bailout2: f64) -> bool, f64 {
+    var zr = 0.0; var zi = 0.0;
+    var iter: u64 = 0;
+    while iter < max_iter {
+        let zr2 = zr * zr; let zi2 = zi * zi;
+        zi = 2.0 * zr * zi + cim;
+        zr = zr2 - zi2 + cre;
+        let mag2 = zr * zr + zi * zi;
+        if mag2 > bailout2 {
+            let nu = (iter as f64) + 1.0 - log(log(mag2) * 0.5) / LN2;
+            return true, max(0.0, nu);
+        }
+        iter += 1;
+    }
+    return false, max_iter as f64;
+}
+
+fn probe_omni(cre: f64, cim: f64, max_iter: u64, bailout2: f64, a: f64) -> bool, f64 {
+    var zr = a / 2.0; var zi = 0.0;
+    var iter: u64 = 0;
+    while iter < max_iter {
+        let den = zr * zr + zi * zi;
+        if !(den > 0.0) { return true, iter as f64; }
+        let wre = a * zr / den;
+        let wim = -a * zi / den;
+        let er, ei = complex_exp(wre, wim);
+        let z2r = zr * zr - zi * zi;
+        let z2i = 2.0 * zr * zi;
+        zr = z2r * er - z2i * ei + cre;
+        zi = z2r * ei + z2i * er + cim;
+        let mag2 = zr * zr + zi * zi;
+        if !is_finite(mag2) { return true, iter as f64; }
+        if mag2 > bailout2 { return true, (iter + 1) as f64; }
+        iter += 1;
+    }
+    return false, max_iter as f64;
+}
+
+fn probe_color(pal: Palette&, ipc: i64, nu: f64) -> u32 {
+    let p = if ipc > 0 { ipc as f64 } else { 1.0 };
+    let t = nu / p;
+    let i = t as i64;
+    let f = t - (i as f64);
+    let c1 = pal_get(pal, i);
+    let c2 = pal_get(pal, i + 1);
+    let r0 = ((c1 >> 16) & 0xFF) as f64; let g0 = ((c1 >> 8) & 0xFF) as f64; let b0 = (c1 & 0xFF) as f64;
+    let r1 = ((c2 >> 16) & 0xFF) as f64; let g1 = ((c2 >> 8) & 0xFF) as f64; let b1 = (c2 & 0xFF) as f64;
+    return (0xFF000000 as u32)
+        | (((r0 + (r1-r0)*f) as i64) as u32 << 16)
+        | (((g0 + (g1-g0)*f) as i64) as u32 << 8)
+        | (((b0 + (b1-b0)*f) as i64) as u32);
+}
+
+fn probe_colors_differ(pal: Palette&, ipc: i64, a: f64, b: f64) -> bool {
+    let ca = probe_color(pal, ipc, a);
+    let cb = probe_color(pal, ipc, b);
+    let dr = max(((ca >> 16) & 0xFF) as i64 - ((cb >> 16) & 0xFF) as i64,
+                  ((cb >> 16) & 0xFF) as i64 - ((ca >> 16) & 0xFF) as i64);
+    let dg = max(((ca >> 8) & 0xFF) as i64 - ((cb >> 8) & 0xFF) as i64,
+                  ((cb >> 8) & 0xFF) as i64 - ((ca >> 8) & 0xFF) as i64);
+    let db = max((ca & 0xFF) as i64 - (cb & 0xFF) as i64,
+                  (cb & 0xFF) as i64 - (ca & 0xFF) as i64);
+    return max(dr, max(dg, db)) >= 2;
+}
+
+fn probe_work(job: Job&) {
+    var pal = Palette { size: job.palette_size, data: copy(job.palette_data) };
+    let n = if job.iter_max > 0 { job.iter_max } else { 1 };
+    let n2 = if n > MAX_ITER_MAX / 4 { MAX_ITER_MAX } else { n * 4 };
+    let aspect = (job.h as f64) / (job.w as f64);
+    let b2 = job.bailout * job.bailout;
+    let start = clock();
+    var changed: i64 = 0; var total: i64 = 0;
+    var row: i64 = 0;
+    while row < PROBE_ROWS {
+        let gy = (row * 17) % PROBE_ROWS;
+        var gx: i64 = 0;
+        while gx < PROBE_COLS {
+            if clock() - start >= PROBE_DEADLINE_MS / 1000.0 { row = PROBE_ROWS; break; }
+            let dx = ((gx as f64 + 0.5) / (PROBE_COLS as f64) - 0.5) * job.width;
+            let dy = (0.5 - (gy as f64 + 0.5) / (PROBE_ROWS as f64)) * job.width * aspect;
+            let cre = job.center_re + dx;
+            let cim = job.center_im + dy;
+            var hit = false;
+            if job.formula == FORMULA_OMNI {
+                let a1, n1 = probe_omni(cre, cim, n, b2, job.omni_a);
+                let a2, n2v = probe_omni(cre, cim, n2, b2, job.omni_a);
+                hit = if a1 != a2 { true } else { if !a1 { false } else { probe_colors_differ(pal, job.iter_per_color as i64, n1, n2v) } };
+            } else {
+                if probe_known_interior(cre, cim) { total += 1; gx += 1; continue; }
+                let a1, n1 = probe_mandel(cre, cim, n, b2);
+                let a2, n2v = probe_mandel(cre, cim, n2, b2);
+                hit = if a1 != a2 { true } else { if !a1 { false } else { probe_colors_differ(pal, job.iter_per_color as i64, n1, n2v) } };
+            }
+            total += 1;
+            if hit { changed += 1; }
+            gx += 1;
+        }
+        row += 1;
+    }
+    if total < PROBE_MIN_SAMPLES { changed = 0; total = 0; }
+    qput(ProbeResult { gen: job.gen, changed: changed, total: total });
+}
+
+fn auto_iter_update(app: AppState&, render_ms: f64) {
+    app.auto_render_ms = render_ms;
+    if !app.auto_iter { app.auto_state = AS_OFF; return; }
+    if app.vibe { app.auto_state = AS_VIBE; return; }
+    if !(app.probe_width > AUTO_DEEP_WIDTH) || !is_finite(app.probe_width) {
+        app.auto_state = AS_DEEP; return;
+    }
+    if app.probe_total == 0 { app.auto_state = AS_HOLD; return; }
+    let sensitivity = (app.probe_changed as f64) / (app.probe_total as f64);
+    app.auto_sensitivity = sensitivity;
+    if sensitivity < AUTO_SENSITIVITY_LO { app.auto_state = AS_CONVERGED; return; }
+    let frame_ms = max(render_ms, 1.0);
+    var factor = AUTO_TARGET_MS / frame_ms;
+    factor = clamp(factor, 1.25, 2.0);
+    if sensitivity < AUTO_SENSITIVITY_HI { factor = min(factor, 1.5); }
+    var next = (app.iter_max as f64 * factor) as u64;
+    if next <= app.iter_max { next = app.iter_max + 1; }
+    if next > MAX_ITER_MAX { next = MAX_ITER_MAX; }
+    if next == app.iter_max { app.auto_state = AS_BUDGET; return; }
+    var estimate = frame_ms * ((next as f64) / (app.iter_max as f64)) * 1.10;
+    var rescue = false;
+    if estimate > AUTO_BUDGET_MS {
+        rescue = true;
+        next = (app.iter_max as f64 * 2.0) as u64;
+        if next <= app.iter_max { next = app.iter_max + 1; }
+        if next > MAX_ITER_MAX { next = MAX_ITER_MAX; }
+        estimate = frame_ms * ((next as f64) / (app.iter_max as f64)) * 1.10;
+        if estimate > AUTO_HARD_MS { app.auto_state = AS_BUDGET; return; }
+    }
+    app.iter_max = next;
+    app.orbit_valid = false;
+    app.need_redraw = true;
+    app.auto_state = if rescue { AS_RESCUE } else { AS_GROW };
+}
+
 // Render exactly the pixel indices handed to us.  The display thread builds
 // a single globally distance-sorted list, so workers consume it in order and
 // the visible fill is a true expanding circle (no horizontal band stripes).
@@ -297,6 +482,9 @@ fn render_chunk(job: Job&) {
         vibe_since_dispatch: 0,
         show_info: false, show_help: false,
         auto_iter: false, auto_state: 0, auto_deep_zoom: false, vibe: false,
+        auto_render_ms: 0.0, auto_sensitivity: 0.0,
+        probe_changed: 0, probe_total: 0, probe_pending: false, probe_width: 0.0,
+        render_start: 0.0, last_render_ms: 0.0,
         period_tol: job.period_tol, recording: false,
         tex: gfx::Texture { id: 0 }, worker_ids: []
     };
@@ -337,8 +525,9 @@ fn render_chunk(job: Job&) {
 thread_fn worker() {
     loop {
         let job = qget<Job>();
-        if job.row_start < 0 { break; }
-        render_chunk(job);
+        if job.is_probe { probe_work(job); }
+        else if job.row_start < 0 { break; }
+        else { render_chunk(job); }
     }
 }
 
@@ -462,7 +651,7 @@ fn enqueue_jobs(app: AppState&) {
             bailout: app.bailout, iter_max: app.iter_max, iter_per_color: app.iter_per_color,
             formula: app.formula, omni_a: app.omni_a, lx: app.lx, ly: app.ly, lz: app.lz,
             color_inside: app.color_inside, row_start: i, row_count: cnt,
-            indices: copy(idxs),
+            indices: copy(idxs), is_probe: false, probe_iter2: 0,
             mouse_cx: app.mouse_cx, mouse_cy: app.mouse_cy, vibe_render: app.vibe,
             delta_c_re: app.delta_c_re, delta_c_im: app.delta_c_im, period_tol: app.period_tol,
             palette_size: app.palette.size, palette_data: copy(app.palette.data),
@@ -531,6 +720,9 @@ fn dispatch_render(app: AppState&) {
     app.pixels_done = 0;
     app.rendering = true;
     app.need_redraw = false;
+    app.render_start = clock();
+    app.probe_width = app.view_width;
+    app.probe_pending = false;
 }
 
 // Bake the accumulated vibe display transform into the committed scene and
@@ -580,7 +772,10 @@ fn main() {
         gen: 0, rendering: false, need_redraw: false,
         pixels_done: 0, pixels_total: 0, mouse_cx: 400, mouse_cy: 300, vibe_since_dispatch: 0,
         show_info: true, show_help: false,
-        auto_iter: false, auto_state: 0, auto_deep_zoom: false, vibe: false,
+        auto_iter: true, auto_state: AS_HOLD, auto_deep_zoom: false, vibe: false,
+        auto_render_ms: 0.0, auto_sensitivity: 0.0,
+        probe_changed: 0, probe_total: 0, probe_pending: false, probe_width: 0.0,
+        render_start: 0.0, last_render_ms: 0.0,
         period_tol: 1e-40, recording: false,
         tex: gfx::Texture { id: 0 }, worker_ids: []
     };
@@ -693,7 +888,11 @@ fn main() {
         if gfx::key_pressed("b") { app.color_inside = if app.color_inside == 1 { 0 } else { 1 }; app.need_redraw = true; }
         if gfx::key_pressed("m") { app.formula = FORMULA_MANDEL; app.orbit_valid = false; app.need_redraw = true; }
         if gfx::key_pressed("o") { app.formula = FORMULA_OMNI; app.orbit_valid = false; app.need_redraw = true; }
-        if gfx::key_pressed("i") { app.auto_iter = !app.auto_iter; }
+        if gfx::key_pressed("i") {
+            app.auto_iter = !app.auto_iter;
+            app.auto_state = if app.auto_iter { AS_HOLD } else { AS_OFF };
+            app.need_redraw = true;
+        }
         if gfx::key_pressed("v") {
             // Do NOT bake/reset the display transform here.  `image` still
             // holds the last complete frame in the pre-transform scene, so
@@ -745,6 +944,20 @@ fn main() {
             app.orbit_valid = false; app.need_redraw = true;
         }
 
+        // ---- collect probe results (adaptive iterations) ----
+        if app.probe_pending {
+            var pmore = true;
+            while pmore {
+                let pres, pok = qpoll<ProbeResult>();
+                if !pok { pmore = false; break; }
+                if pres.gen != app.gen { continue; }
+                app.probe_changed = pres.changed;
+                app.probe_total = pres.total;
+                app.probe_pending = false;
+                auto_iter_update(app, app.last_render_ms);
+            }
+        }
+
         // ---- collect results without blocking ----
         if app.rendering {
             var more = true;
@@ -766,6 +979,27 @@ fn main() {
             }
             if app.pixels_done >= app.pixels_total {
                 app.rendering = false;
+                let render_ms = (clock() - app.render_start) * 1000.0;
+                app.last_render_ms = render_ms;
+                let can_probe = app.auto_iter && !app.vibe
+                    && app.probe_width > AUTO_DEEP_WIDTH && is_finite(app.probe_width);
+                if can_probe {
+                    qput(Job {
+                        gen: app.gen, w: app.w, h: app.h, ss: 1,
+                        center_re: app.c_re, center_im: app.c_im, width: app.view_width,
+                        bailout: app.bailout, iter_max: app.iter_max, iter_per_color: app.iter_per_color,
+                        formula: app.formula, omni_a: app.omni_a, lx: app.lx, ly: app.ly, lz: app.lz,
+                        color_inside: app.color_inside, row_start: -2, row_count: 0, indices: [],
+                        is_probe: true, probe_iter2: 0,
+                        mouse_cx: app.mouse_cx, mouse_cy: app.mouse_cy, vibe_render: false,
+                        delta_c_re: app.delta_c_re, delta_c_im: app.delta_c_im, period_tol: app.period_tol,
+                        palette_size: app.palette.size, palette_data: copy(app.palette.data),
+                        orbit_re: [], orbit_im: [], has_orbit: false
+                    });
+                    app.probe_pending = true;
+                } else {
+                    auto_iter_update(app, render_ms);
+                }
                 if app.vibe { app.need_redraw = true; }
             }
         }
@@ -831,6 +1065,8 @@ fn main() {
                     format(line, "center: ", app.c_re, " ", app.c_im); ui::label(ctx, line, ui::TEXT_LEFT);
                     line = []; format(line, "width: ", app.view_width); ui::label(ctx, line, ui::TEXT_LEFT);
                     line = []; format(line, "iter_max: ", app.iter_max); ui::label(ctx, line, ui::TEXT_LEFT);
+                    line = []; format(line, "adaptive: ", auto_state_name(app.auto_state)); ui::label(ctx, line, ui::TEXT_LEFT);
+                    line = []; format(line, "  sens: ", app.auto_sensitivity * 100.0, "% frame: ", app.auto_render_ms, "ms"); ui::label(ctx, line, ui::TEXT_LEFT);
                     line = []; format(line, "iter/color: ", app.iter_per_color); ui::label(ctx, line, ui::TEXT_LEFT);
                     line = []; format(line, "bailout: ", app.bailout); ui::label(ctx, line, ui::TEXT_LEFT);
                     line = []; format(line, "ssaa: ", app.ss); ui::label(ctx, line, ui::TEXT_LEFT);
@@ -867,7 +1103,7 @@ fn main() {
             center_re: 0.0, center_im: 0.0, width: 0.0, bailout: 0.0,
             iter_max: 0, iter_per_color: 0, formula: 0, omni_a: 0.0,
             lx: 0.0, ly: 0.0, lz: 0.0, color_inside: 0,
-            row_start: -1, row_count: 0, indices: [], mouse_cx: 0, mouse_cy: 0, vibe_render: false,
+            row_start: -1, row_count: 0, indices: [], is_probe: false, probe_iter2: 0, mouse_cx: 0, mouse_cy: 0, vibe_render: false,
             delta_c_re: 0.0, delta_c_im: 0.0, period_tol: 0.0,
             palette_size: 0, palette_data: [],
             orbit_re: [], orbit_im: [], has_orbit: false
