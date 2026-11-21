@@ -419,9 +419,8 @@ fn dispatch_render(app: AppState&) {
     // transform. Remember both so the transform can be rebased when the frame
     // completes; do not touch c.. or disp here, otherwise the last complete
     // frame would jump on screen.
-    let w = app.w as f64;
-    app.pend_re = app.c_re + app.disp_pan_x * app.view_width / w;
-    app.pend_im = app.c_im - app.disp_pan_y * app.view_width / w;
+    app.pend_re = app.c_re + app.disp_pan_x * app.view_width;
+    app.pend_im = app.c_im - app.disp_pan_y * app.view_width;
     app.pend_width = app.view_width / app.disp_scale;
     app.pend_valid = true;
     app.snap_scale = app.disp_scale;
@@ -455,9 +454,8 @@ fn dispatch_render(app: AppState&) {
 // reset it, so the freshly completed frame and the display agree exactly.
 fn commit_transform(app: AppState&) {
     app.pend_valid = false;
-    let w = app.w as f64;
-    app.c_re += app.disp_pan_x * app.view_width / w;
-    app.c_im -= app.disp_pan_y * app.view_width / w;
+    app.c_re += app.disp_pan_x * app.view_width;
+    app.c_im -= app.disp_pan_y * app.view_width;
     app.view_width /= app.disp_scale;
     app.disp_scale = 1.0;
     app.disp_pan_x = 0.0;
