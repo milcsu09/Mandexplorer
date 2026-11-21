@@ -2522,10 +2522,22 @@ main (i32 argc, char **argv)
 
           // Refresh the underlying render periodically, but never while the
           // background GPU job is in flight: terminating then would block on
-          // it.  The GPU completion itself commits the frame.
+          // it.  A completed GPU frame is adopted here, at a commit boundary,
+          // so the accumulated zoom baked into the scene is small and the
+          // view does not jump.
           if (vibe_counter % 15 == 0 && !gpu_vibe_inflight)
             {
               terminate ();
+
+              if (atomic_load (&gpu_vibe_done))
+                {
+                  atomic_store (&gpu_vibe_done, false);
+                  for (i32 y = 0; y < s.image->h; ++y)
+                    for (i32 x = 0; x < s.image->w; ++x)
+                      image_set2 (s.image, x, y,
+                                  image_get2 (gpu_vibe_image, x, y));
+                }
+
               s.redraw = true;
             }
         }
@@ -3069,18 +3081,6 @@ main (i32 argc, char **argv)
               printf ("Recording render finished: %zu frames -> '%s'\n",
                       recorded_count, video_path);
             }
-        }
-
-      // If the background GPU render in vibe mode has finished, adopt its
-      // sharp result.
-      if (vibe && atomic_load (&gpu_vibe_done))
-        {
-          atomic_store (&gpu_vibe_done, false);
-          terminate ();
-          for (i32 y = 0; y < s.image->h; ++y)
-            for (i32 x = 0; x < s.image->w; ++x)
-              image_set2 (s.image, x, y, image_get2 (gpu_vibe_image, x, y));
-          s.redraw = true;
         }
 
       // A GPU job writes s.image from a worker.  Never upload a frame while
