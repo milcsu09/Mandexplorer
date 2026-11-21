@@ -10,7 +10,6 @@ import vec;
 
 struct QV { pos: float2, uv: float2 }
 struct ViewP { p: float4 }
-struct RingP { p: float4 }
 
 const LN2: f64 = 0.6931471805599453;
 
@@ -28,6 +27,7 @@ struct Job {
     formula: i32, omni_a: f64, lx: f64, ly: f64, lz: f64,
     color_inside: i32,
     row_start: i64, row_count: i64,
+    indices: i32[],
     mouse_cx: i64, mouse_cy: i64, vibe_render: bool,
     delta_c_re: f64, delta_c_im: f64, period_tol: f64,
     palette_size: i64, palette_data: u32[],
@@ -38,7 +38,6 @@ struct Job {
 // The main thread scatters them into the displayed image so the fresh
 // pixels expand as a circle around the cursor (as in the original C build).
 struct PixResult { gen: u64, indices: i32[], colors: u32[] }
-struct Px { x: i64, y: i64, idx: i32, dx2: f64 }
 struct RowJob { y: i64, cnt: i64, r2: f64 }
 
 root struct AppState {
@@ -274,7 +273,10 @@ fn pixel_color(app: AppState&, dx: f64, dy: f64) -> u32 {
 // Render a job's rows, but walk the pixels in increasing distance from the
 // mouse and stream them back in small batches.  The display thread scatters
 // each batch into the visible image, producing the expanding circle.
-fn render_sorted(job: Job&, y0: i64, count: i64) {
+// Render exactly the pixel indices handed to us.  The display thread builds
+// a single globally distance-sorted list, so workers consume it in order and
+// the visible fill is a true expanding circle (no horizontal band stripes).
+fn render_chunk(job: Job&) {
     var pa = AppState {
         c_re: job.center_re, c_im: job.center_im, view_width: job.width,
         bailout: job.bailout, lx: job.lx, ly: job.ly, lz: job.lz,
@@ -291,39 +293,26 @@ fn render_sorted(job: Job&, y0: i64, count: i64) {
         palette: Palette { size: job.palette_size, data: copy(job.palette_data) },
         palette_path: [],
         gen: job.gen, rendering: false, need_redraw: false,
-        pixels_done: 0, pixels_total: 0, mouse_cx: job.mouse_cx, mouse_cy: job.mouse_cy, vibe_since_dispatch: 0,
+        pixels_done: 0, pixels_total: 0, mouse_cx: job.mouse_cx, mouse_cy: job.mouse_cy,
+        vibe_since_dispatch: 0,
         show_info: false, show_help: false,
         auto_iter: false, auto_state: 0, auto_deep_zoom: false, vibe: false,
         period_tol: job.period_tol, recording: false,
         tex: gfx::Texture { id: 0 }, worker_ids: []
     };
 
-    // Build this worker's slice of pixels, sorted by distance from the mouse.
-    var pts: Px[>..] = [];
-    let cx = job.mouse_cx as f64;
-    let cy = job.mouse_cy as f64;
-    for ry in count {
-        let y = y0 + ry;
-        if y >= job.h { break; }
-        for x in job.w {
-            let dx = (x as f64) - cx;
-            let dy = (y as f64) - cy;
-            let r2 = dx * dx + dy * dy;
-            if job.vibe_render && r2 > 250.0 * 250.0 { continue; }
-            pts.push(Px { x: x, y: y, idx: ((y * job.w + x) as i32), dx2: r2 });
-        }
-    }
-    sort(pts) { a, b => a.dx2 < b.dx2 };
-
     let ss = job.ss;
     var idxs: i32[>..] = [];
     var cols: u32[>..] = [];
-    for p in pts {
+    for k in job.indices.len {
+        let idx = job.indices[k];
+        let x = idx % job.w;
+        let y = idx / job.w;
         var r: u32 = 0; var g: u32 = 0; var b: u32 = 0;
         for sy in ss {
             for sx in ss {
-                let fx = (p.x as f64) + (sx as f64 + 0.5) / (ss as f64);
-                let fy = (p.y as f64) + (sy as f64 + 0.5) / (ss as f64);
+                let fx = (x as f64) + (sx as f64 + 0.5) / (ss as f64);
+                let fy = (y as f64) + (sy as f64 + 0.5) / (ss as f64);
                 let dx = (fx - (job.w as f64) / 2.0) * job.width / (job.w as f64);
                 let dy = ((job.h as f64) / 2.0 - fy) * job.width / (job.w as f64);
                 let col = pixel_color(pa, dx, dy);
@@ -333,7 +322,7 @@ fn render_sorted(job: Job&, y0: i64, count: i64) {
             }
         }
         let n = (ss * ss) as u32;
-        idxs.push(p.idx);
+        idxs.push(idx);
         cols.push((((r / n) & 0xFF) << 16) | (((g / n) & 0xFF) << 8) | ((b / n) & 0xFF) | (0xFF000000 as u32));
         if idxs.len >= 256 {
             qput(PixResult { gen: job.gen, indices: copy(idxs), colors: copy(cols) });
@@ -349,7 +338,7 @@ thread_fn worker() {
     loop {
         let job = qget<Job>();
         if job.row_start < 0 { break; }
-        render_sorted(job, job.row_start, job.row_count);
+        render_chunk(job);
     }
 }
 
@@ -423,31 +412,63 @@ fn save_scene(path: const u8[:], app: AppState&) -> bool {
 }
 
 fn enqueue_jobs(app: AppState&) {
-    // Enqueue row bands in order of distance from the mouse, so workers pick
-    // up the nearest bands first and the visible fill expands as a circle.
-    let rows_per_job = 8;
-    var jobs: RowJob[>..] = [];
-    var y = 0;
-    while y < app.h {
-        let cnt = if y + rows_per_job < app.h { rows_per_job } else { app.h - y };
-        let dy = ((y as f64) + (cnt as f64) / 2.0) - (app.mouse_cy as f64);
-        let dx = (app.w as f64) / 2.0 - (app.mouse_cx as f64);
-        jobs.push(RowJob { y: y, cnt: cnt, r2: dx * dx + dy * dy });
-        y = y + cnt;
+    // One GLOBAL ordering of all pixels by distance from the mouse, built
+    // with a counting sort (O(n)).  Workers get consecutive slices of it, so
+    // results come back as true concentric circles instead of row stripes.
+    let maxr2 = if app.vibe { 250 * 250 }
+                else { (app.w / 2) * (app.w / 2) + (app.h / 2) * (app.h / 2) };
+    var counts: i64[>..] = [];
+    counts.resize(maxr2 + 1, 0);
+    var n: i64 = 0;
+    for y in app.h {
+        let dy = (y as f64) - (app.mouse_cy as f64);
+        for x in app.w {
+            let dx = (x as f64) - (app.mouse_cx as f64);
+            let r2 = (dx * dx + dy * dy) as i64;
+            if r2 <= maxr2 { counts[r2] = counts[r2] + 1; n = n + 1; }
+        }
     }
-    sort(jobs) { a, b => a.r2 < b.r2 };
-    for j in jobs {
+    var sum: i64 = 0;
+    for r in counts.len {
+        let c = counts[r];
+        counts[r] = sum;
+        sum = sum + c;
+    }
+    var sorted: i32[>..] = [];
+    sorted.resize(n, 0);
+    for y in app.h {
+        let dy = (y as f64) - (app.mouse_cy as f64);
+        for x in app.w {
+            let dx = (x as f64) - (app.mouse_cx as f64);
+            let r2 = (dx * dx + dy * dy) as i64;
+            if r2 <= maxr2 {
+                sorted[counts[r2]] = (y * app.w + x) as i32;
+                counts[r2] = counts[r2] + 1;
+            }
+        }
+    }
+
+    app.pixels_total = n;
+    let chunk = 4096;
+    var i: i64 = 0;
+    while i < n {
+        let cnt = if i + chunk < n { chunk } else { n - i };
+        var idxs: i32[>..] = [];
+        idxs.resize(cnt, 0);
+        for k in cnt { idxs[k] = sorted[i + k]; }
         qput(Job {
             gen: app.gen, w: app.w, h: app.h, ss: app.ss,
             center_re: app.c_re, center_im: app.c_im, width: app.view_width,
             bailout: app.bailout, iter_max: app.iter_max, iter_per_color: app.iter_per_color,
             formula: app.formula, omni_a: app.omni_a, lx: app.lx, ly: app.ly, lz: app.lz,
-            color_inside: app.color_inside, row_start: j.y, row_count: j.cnt,
+            color_inside: app.color_inside, row_start: i, row_count: cnt,
+            indices: copy(idxs),
             mouse_cx: app.mouse_cx, mouse_cy: app.mouse_cy, vibe_render: app.vibe,
             delta_c_re: app.delta_c_re, delta_c_im: app.delta_c_im, period_tol: app.period_tol,
             palette_size: app.palette.size, palette_data: copy(app.palette.data),
             orbit_re: copy(app.orbit_re), orbit_im: copy(app.orbit_im), has_orbit: app.orbit_valid
         });
+        i = i + cnt;
     }
 }
 
@@ -508,19 +529,6 @@ fn dispatch_render(app: AppState&) {
     for i in app.w * app.h { app.render_buf[i] = app.image[i]; }
     enqueue_jobs(app);
     app.pixels_done = 0;
-    if app.vibe {
-        var n: i64 = 0;
-        for y in app.h {
-            let dy = (y as f64) - (app.mouse_cy as f64);
-            for x in app.w {
-                let dx = (x as f64) - (app.mouse_cx as f64);
-                if dx * dx + dy * dy <= 250.0 * 250.0 { n = n + 1; }
-            }
-        }
-        app.pixels_total = n;
-    } else {
-        app.pixels_total = app.w * app.h;
-    }
     app.rendering = true;
     app.need_redraw = false;
 }
@@ -624,18 +632,11 @@ fn main() {
     let quad_fs = embed_shader("frag", """
         layout(set = 2, binding = 0) uniform sampler2D tex;
         layout(set = 3, binding = 0) uniform View { vec4 p; };
-        layout(set = 3, binding = 1) uniform Ring { vec4 r; };
-        layout(set = 3, binding = 2) uniform Aspect { vec4 a; };
         layout(location = 0) in vec2 v_uv;
         layout(location = 0) out vec4 result;
         void main() {
             vec2 uv = (v_uv - vec2(0.5)) / p.x + vec2(0.5) + p.yz;
             result = texture(tex, uv);
-            if (r.w > 0.5) {
-                vec2 d = (v_uv - r.xy) * vec2(1.0, a.x);
-                float dist = length(d);
-                if (abs(dist - r.z) < 0.0035) result.rgb = vec3(1.0, 0.45, 0.0);
-            }
         }
         """);
     var qdesc = gfx::PipelineDesc { };
@@ -817,19 +818,6 @@ fn main() {
             (app.disp_pan_x / (app.w as f64)) as f32,
             (app.disp_pan_y / (app.h as f64)) as f32,
             0.0 as f32 } });
-        var ring_active: f32 = 0.0;
-        var ring_r: f32 = 0.0;
-        if app.vibe && app.rendering && app.pixels_total > 0 {
-            ring_active = 1.0;
-            let frac = (app.pixels_done as f64) / (app.pixels_total as f64);
-            ring_r = (250.0 * sqrt(frac) / (app.w as f64)) as f32;
-        }
-        gfx::uniforms(gfx::FRAGMENT, 1, RingP { p: float4 {
-            (app.mouse_cx as f64 / (app.w as f64)) as f32,
-            (app.mouse_cy as f64 / (app.h as f64)) as f32,
-            ring_r, ring_active } });
-        gfx::uniforms(gfx::FRAGMENT, 2, RingP { p: float4 {
-            (app.h as f64 / (app.w as f64)) as f32, 0.0 as f32, 0.0 as f32, 0.0 as f32 } });
         gfx::bind_vertex_buffer(qvb);
         gfx::draw(3);
         gfx::end_pass();
@@ -879,7 +867,7 @@ fn main() {
             center_re: 0.0, center_im: 0.0, width: 0.0, bailout: 0.0,
             iter_max: 0, iter_per_color: 0, formula: 0, omni_a: 0.0,
             lx: 0.0, ly: 0.0, lz: 0.0, color_inside: 0,
-            row_start: -1, row_count: 0, mouse_cx: 0, mouse_cy: 0, vibe_render: false,
+            row_start: -1, row_count: 0, indices: [], mouse_cx: 0, mouse_cy: 0, vibe_render: false,
             delta_c_re: 0.0, delta_c_im: 0.0, period_tol: 0.0,
             palette_size: 0, palette_data: [],
             orbit_re: [], orbit_im: [], has_orbit: false
