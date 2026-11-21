@@ -2811,13 +2811,11 @@ main (i32 argc, char **argv)
               // In vibe mode render on the CPU so the expanding circle of
               // progress stays visible (GPU walks a 2D grid and commits the
               // whole frame at once).  Non-vibe renders may still use the GPU.
-              // At high iteration counts the CPU circle is too slow and
-              // stalls the zoom, so use the GPU for the whole frame instead.
               const bool use_gpu =
-                gpu_is_available ()
+                !vibe
+                && gpu_is_available ()
                 && gpu_should_use (s.w, s.h, s.render_ss, s.scene->iter_max,
-                                   s.scene->width, s.formula, s.render_vibe)
-                && (!vibe || s.scene->iter_max > 1000);
+                                   s.scene->width, s.formula, s.render_vibe);
 
               // Build a list of every pixel, sorted by distance from the mouse,
               // so CPU rendering fills the image in expanding rings (circles)
