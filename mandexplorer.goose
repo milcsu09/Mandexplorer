@@ -317,8 +317,12 @@ thread_fn worker() {
     loop {
         let job = qget<Job>();
         if job.row_start < 0 { break; }
-        let px = render_rows(job, job.row_start, job.row_count);
-        qput(RowResult { gen: job.gen, y: job.row_start, pixels: copy(px) });
+        for r in job.row_count {
+            let y = job.row_start + r;
+            if y >= job.h { break; }
+            let px = render_rows(job, y, 1);
+            qput(RowResult { gen: job.gen, y: y, pixels: copy(px) });
+        }
     }
 }
 
@@ -391,9 +395,8 @@ fn save_scene(path: const u8[:], app: AppState&) -> bool {
     return write_file_atomic(path, out);
 }
 
-fn enqueue_jobs(app: AppState&) -> i64 {
+fn enqueue_jobs(app: AppState&) {
     let rows_per_job = 8;
-    var njobs: i64 = 0;
     var y = 0;
     while y < app.h {
         let cnt = if y + rows_per_job < app.h { rows_per_job } else { app.h - y };
@@ -408,9 +411,7 @@ fn enqueue_jobs(app: AppState&) -> i64 {
             orbit_re: copy(app.orbit_re), orbit_im: copy(app.orbit_im), has_orbit: app.orbit_valid
         });
         y = y + cnt;
-        njobs = njobs + 1;
     }
-    return njobs;
 }
 
 fn dispatch_render(app: AppState&) {
@@ -437,8 +438,9 @@ fn dispatch_render(app: AppState&) {
     app.gen = app.gen + 1;
     compute_orbit(app);
     app.render_buf.resize(app.w * app.h, 0);
+    enqueue_jobs(app);
     app.rows_done = 0;
-    app.rows_total = enqueue_jobs(app);
+    app.rows_total = app.h;
     app.rendering = true;
     app.need_redraw = false;
 
