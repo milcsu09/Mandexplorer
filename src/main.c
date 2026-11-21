@@ -2515,11 +2515,10 @@ main (i32 argc, char **argv)
           s.pan_x = world_x - (sx / s.scale);
           s.pan_y = world_y - (sy / s.scale);
 
-          // Refresh the underlying render periodically.  Every 15th step
-          // starts a fresh render at the current zoom, so the expanding
-          // circle of progress stays visible instead of snapping to a full
-          // frame.
-          if (vibe_counter % 15 == 0)
+          // Refresh the underlying render periodically, but never while the
+          // background GPU job is in flight: terminating then would block on
+          // it.  The GPU completion itself commits the frame.
+          if (vibe_counter % 15 == 0 && !gpu_job_active)
             {
               terminate ();
               s.redraw = true;
