@@ -2525,7 +2525,8 @@ main (i32 argc, char **argv)
           // it.  A completed GPU frame is adopted here, at a commit boundary,
           // so the accumulated zoom baked into the scene is small and the
           // view does not jump.
-          if (vibe_counter % 15 == 0 && !gpu_vibe_inflight)
+          if (vibe_counter % 15 == 0
+              && !gpu_job_active && !gpu_vibe_inflight)
             {
               terminate ();
 
@@ -2810,11 +2811,13 @@ main (i32 argc, char **argv)
               // In vibe mode render on the CPU so the expanding circle of
               // progress stays visible (GPU walks a 2D grid and commits the
               // whole frame at once).  Non-vibe renders may still use the GPU.
+              // At high iteration counts the CPU circle is too slow and
+              // stalls the zoom, so use the GPU for the whole frame instead.
               const bool use_gpu =
-                !vibe
-                && gpu_is_available ()
+                gpu_is_available ()
                 && gpu_should_use (s.w, s.h, s.render_ss, s.scene->iter_max,
-                                   s.scene->width, s.formula, s.render_vibe);
+                                   s.scene->width, s.formula, s.render_vibe)
+                && (!vibe || s.scene->iter_max > 1000);
 
               // Build a list of every pixel, sorted by distance from the mouse,
               // so CPU rendering fills the image in expanding rings (circles)
@@ -2946,7 +2949,7 @@ main (i32 argc, char **argv)
               // In vibe mode, also kick off a background GPU render into a
               // separate buffer.  When it completes, its sharp result replaces
               // the partial CPU circle.
-              if (vibe && !gpu_vibe_inflight)
+              if (vibe && s.scene->iter_max <= 1000 && !gpu_vibe_inflight)
                 {
                   struct gpu_view gv;
                   gv.c_re = s.center_re;
