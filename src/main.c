@@ -3076,11 +3076,17 @@ main (i32 argc, char **argv)
       if (vibe && atomic_load (&gpu_vibe_done))
         {
           atomic_store (&gpu_vibe_done, false);
-          terminate ();
-          for (i32 y = 0; y < s.image->h; ++y)
-            for (i32 x = 0; x < s.image->w; ++x)
-              image_set2 (s.image, x, y, image_get2 (gpu_vibe_image, x, y));
-          s.redraw = true;
+          // Only adopt the GPU frame while the accumulated zoom is small,
+          // otherwise the commit (baking many frames of zoom at once) causes
+          // a visible jerk at the seam.  A stale GPU frame is discarded.
+          if (s.scale < 1.3)
+            {
+              terminate ();
+              for (i32 y = 0; y < s.image->h; ++y)
+                for (i32 x = 0; x < s.image->w; ++x)
+                  image_set2 (s.image, x, y, image_get2 (gpu_vibe_image, x, y));
+              s.redraw = true;
+            }
         }
 
       // A GPU job writes s.image from a worker.  Never upload a frame while
