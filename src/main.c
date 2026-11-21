@@ -2781,8 +2781,7 @@ main (i32 argc, char **argv)
               // progress stays visible (GPU walks a 2D grid and commits the
               // whole frame at once).  Non-vibe renders may still use the GPU.
               const bool use_gpu =
-                !vibe
-                && gpu_is_available ()
+                gpu_is_available ()
                 && gpu_should_use (s.w, s.h, s.render_ss, s.scene->iter_max,
                                    s.scene->width, s.formula, s.render_vibe);
 
@@ -2929,6 +2928,9 @@ main (i32 argc, char **argv)
                 {
                   auto_iter_update (compute_image_total, vibe);
                   s.phase = PHASE_IDLE;
+
+                  if (vibe)
+                    s.redraw = true;
 
                   break;
                 }
