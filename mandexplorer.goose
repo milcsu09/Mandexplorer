@@ -613,7 +613,12 @@ fn main() {
         if gfx::key_pressed("o") { app.formula = FORMULA_OMNI; app.orbit_valid = false; app.need_redraw = true; }
         if gfx::key_pressed("i") { app.auto_iter = !app.auto_iter; }
         if gfx::key_pressed("v") {
-            if app.vibe { commit_transform(app); }
+            // Do NOT bake/reset the display transform here.  `image` still
+            // holds the last complete frame in the pre-transform scene, so
+            // resetting disp to identity would snap the screen back to that
+            // old frame until a fresh render finishes (the "zig-zag").
+            // Freezing disp keeps the current view pixel-identical; the
+            // completion rebase folds it into the next committed scene.
             app.vibe = !app.vibe;
             if app.vibe { ss_prev = app.ss; app.ss = 1; }
             else { app.ss = ss_prev; }
