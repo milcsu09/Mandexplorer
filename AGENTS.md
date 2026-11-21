@@ -23,6 +23,12 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 ## Period detection
 - Threshold in `main.c` (~line 904): `period_tol > 1e-61 && ...`. Default 1e-40. Tunable via global `period_tol`.
 
+## Vibe zoom
+- The display thread only presents the last complete texture; orbit and GPU/CPU rendering run outside it.
+- A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
+- Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
+- `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
+
 ## Notes
 - `terminate()` called before state changes requiring recompute.
 - `apply_iter_max()` reallocates orbit buffers.

@@ -101,8 +101,6 @@ static struct
   i32 mouse_cx;
   i32 mouse_cy;
 
-  bool vibe;
-
   SDL_Window *window;
   SDL_Renderer *renderer;
 
@@ -125,6 +123,12 @@ static struct
 
   i32 ss;
   i32 ss_prev;
+
+  // Snapshot of the sampling/mode used by the render that is currently in
+  // flight.  The display may toggle SSAA or vibe while workers are running;
+  // those workers must keep the values they started with.
+  i32 render_ss;
+  bool render_vibe;
 
   f64 pan_x;
   f64 pan_y;
@@ -155,6 +159,11 @@ static struct
 static struct point *render_pixels = NULL;
 static usize render_pixel_count = 0;
 static usize render_pixels_cap = 0;
+
+// True while a GPU frame is being produced by a worker.  The display must not
+// upload s.image while the GPU job is still writing it, and in vibe mode it
+// must not wait for that job either: it keeps showing the last complete frame.
+static _Atomic bool gpu_job_active;
 
 static usize *render_counts = NULL;
 static usize render_counts_cap = 0;
@@ -266,6 +275,8 @@ terminate (void)
   thread_pool_clear (s.pool);
 
   thread_pool_wait (s.pool);
+
+  atomic_store (&gpu_job_active, false);
 
   s.phase = PHASE_IDLE;
 
@@ -500,6 +511,43 @@ n_tiles (void)
     return 4;
 
   return s.sectors;
+}
+
+
+// GPU rendering is a long, uninterrupted OpenCL call.  Running it on the
+// display thread freezes the zoom for the whole frame time (clFinish plus a
+// blocking read), so it runs in the pool and only publishes the result when
+// the frame is complete.  There is at most one GPU job in flight; terminate()
+// waits for it before the scene or the orbit buffers are mutated.
+struct gpu_job_args
+{
+  struct gpu_view view;
+  i32 generation;
+};
+
+static struct gpu_job_args gpu_job_args;
+
+static void
+gpu_job (void *argument)
+{
+  struct gpu_job_args *args = argument;
+
+  const bool current = args->generation == atomic_load (&s.generation);
+
+  if (current)
+    gpu_render_mandelbrot (&args->view, s.image);
+
+  // Publish "the image is no longer being written" before claiming the
+  // result.  The display may then upload it without waiting for another
+  // frame; the reverse order would let PHASE_COMPUTE_IMAGE set redraw while
+  // the upload is still suppressed by gpu_job_active.
+  atomic_store (&gpu_job_active, false);
+
+  // A newer view may have been requested while the kernel was running.
+  // Do not claim the result in that case; terminate() has already reset
+  // tiles_done and the next render owns the image.
+  if (current && args->generation == atomic_load (&s.generation))
+    atomic_store (&s.tiles_done, n_tiles ());
 }
 
 
@@ -1339,8 +1387,8 @@ worker (void *argument)
 {
   struct work *work = argument;
 
-  const f64 sample = 1.0 / s.ss;
-  const i32 samples = s.ss * s.ss;
+  const f64 sample = 1.0 / s.render_ss;
+  const i32 samples = s.render_ss * s.render_ss;
 
   const f64 scale = s.scene->width / s.w;
 
@@ -1353,7 +1401,7 @@ worker (void *argument)
       if (s.work_generation != atomic_load (&s.generation))
         return;
 
-      if (s.vibe && render_pixels[i].r2 > 250.0 * 250.0)
+      if (s.render_vibe && render_pixels[i].r2 > 250.0 * 250.0)
         continue;
 
       const i32 x = render_pixels[i].x;
@@ -1361,8 +1409,8 @@ worker (void *argument)
 
       u64 r = 0, g = 0, b = 0;
 
-      for (i32 sy = 0; sy < s.ss; ++sy)
-        for (i32 sx = 0; sx < s.ss; ++sx)
+      for (i32 sy = 0; sy < s.render_ss; ++sy)
+        for (i32 sx = 0; sx < s.render_ss; ++sx)
           {
             if (s.work_generation != atomic_load (&s.generation))
               return;
@@ -2436,29 +2484,29 @@ main (i32 argc, char **argv)
       if (rendering_video)
         vibe = false;
 
-      s.vibe = vibe;
-
       if (vibe)
         {
           static u64 vibe_counter = 0;
-
           vibe_counter++;
 
           i32 mx, my;
           SDL_GetMouseState (&mx, &my);
           const f64 sx = mx - s.w / 2.0;
           const f64 sy = my - s.h / 2.0;
+
           const f64 zoom = 1.02;
+
           const f64 world_x = (sx / s.scale) + s.pan_x;
           const f64 world_y = (sy / s.scale) + s.pan_y;
           s.scale *= zoom;
           s.pan_x = world_x - (sx / s.scale);
           s.pan_y = world_y - (sy / s.scale);
 
-          // Refresh the underlying render periodically, but never interrupt an
-          // in-flight orbit computation: doing so stalls the whole frame and
-          // freezes the zoom.  While computing the orbit, just keep zooming.
-          if (vibe_counter % 4 == 0 && s.phase != PHASE_COMPUTE_ORBIT)
+          // Refresh the underlying render periodically.  Every 15th step
+          // starts a fresh render at the current zoom, so the expanding
+          // circle of progress stays visible instead of snapping to a full
+          // frame.
+          if (vibe_counter % 15 == 0)
             {
               terminate ();
               s.redraw = true;
@@ -2533,7 +2581,6 @@ main (i32 argc, char **argv)
                 {
                   recording = false;
                   vibe = false;
-                  s.vibe = false;
 
                   start_render_phase ();
                 }
@@ -2728,77 +2775,91 @@ main (i32 argc, char **argv)
 
               s.phase = PHASE_COMPUTE_IMAGE;
 
+              s.render_ss = s.ss;
+              s.render_vibe = vibe;
+
+              // In vibe mode render on the CPU so the expanding circle of
+              // progress stays visible (GPU walks a 2D grid and commits the
+              // whole frame at once).  Non-vibe renders may still use the GPU.
+              const bool use_gpu =
+                !vibe
+                && gpu_is_available ()
+                && gpu_should_use (s.w, s.h, s.render_ss, s.scene->iter_max,
+                                   s.scene->width, s.formula, s.render_vibe);
+
               // Build a list of every pixel, sorted by distance from the mouse,
-              // so rendering fills the image in expanding rings (circles) around
-              // the cursor with no square-tile artefacts.
-              render_pixel_count = (usize)s.w * (usize)s.h;
-
-              if (render_pixel_count > render_pixels_cap)
+              // so CPU rendering fills the image in expanding rings (circles)
+              // around the cursor with no square-tile artefacts.  The GPU
+              // kernel walks its own 2D grid, so this work is skipped there.
+              if (!use_gpu)
                 {
-                  free (render_pixels);
-                  render_pixels = malloc (render_pixel_count * sizeof (struct point));
-                  render_pixels_cap = render_pixels ? render_pixel_count : 0;
-                }
+                  render_pixel_count = (usize)s.w * (usize)s.h;
 
-              if (render_pixels)
-                {
-                  i32 maxr2 = 0;
-                  const i32 dxs[2] = { s.mouse_cx, s.w - 1 - s.mouse_cx };
-                  const i32 dys[2] = { s.mouse_cy, s.h - 1 - s.mouse_cy };
-
-                  for (i32 i = 0; i < 2; ++i)
-                    for (i32 j = 0; j < 2; ++j)
-                      {
-                        const i32 r2 = dxs[i] * dxs[i] + dys[j] * dys[j];
-                        if (r2 > maxr2) maxr2 = r2;
-                      }
-
-                  if ((usize)maxr2 + 1 > render_counts_cap)
+                  if (render_pixel_count > render_pixels_cap)
                     {
-                      free (render_counts);
-                      render_counts = calloc ((usize)maxr2 + 1, sizeof (usize));
-                      render_counts_cap = render_counts ? (usize)maxr2 + 1 : 0;
+                      free (render_pixels);
+                      render_pixels = malloc (render_pixel_count * sizeof (struct point));
+                      render_pixels_cap = render_pixels ? render_pixel_count : 0;
                     }
 
-                  if (render_counts)
+                  if (render_pixels)
                     {
-                      memset (render_counts, 0, ((usize)maxr2 + 1) * sizeof (usize));
+                      i32 maxr2 = 0;
+                      const i32 dxs[2] = { s.mouse_cx, s.w - 1 - s.mouse_cx };
+                      const i32 dys[2] = { s.mouse_cy, s.h - 1 - s.mouse_cy };
 
-                      for (i32 y = 0; y < s.h; ++y)
-                        for (i32 x = 0; x < s.w; ++x)
+                      for (i32 i = 0; i < 2; ++i)
+                        for (i32 j = 0; j < 2; ++j)
                           {
-                            const i32 dx = x - s.mouse_cx;
-                            const i32 dy = y - s.mouse_cy;
-                            const i32 r2 = dx * dx + dy * dy;
-                            render_counts[r2]++;
+                            const i32 r2 = dxs[i] * dxs[i] + dys[j] * dys[j];
+                            if (r2 > maxr2) maxr2 = r2;
                           }
 
-                      usize sum = 0;
-                      for (i32 r = 0; r <= maxr2; ++r)
+                      if ((usize)maxr2 + 1 > render_counts_cap)
                         {
-                          const usize c = render_counts[r];
-                          render_counts[r] = sum;
-                          sum += c;
+                          free (render_counts);
+                          render_counts = calloc ((usize)maxr2 + 1, sizeof (usize));
+                          render_counts_cap = render_counts ? (usize)maxr2 + 1 : 0;
                         }
 
-                      for (i32 y = 0; y < s.h; ++y)
-                        for (i32 x = 0; x < s.w; ++x)
-                          {
-                            const i32 dx = x - s.mouse_cx;
-                            const i32 dy = y - s.mouse_cy;
-                            const i32 r2 = dx * dx + dy * dy;
+                      if (render_counts)
+                        {
+                          memset (render_counts, 0, ((usize)maxr2 + 1) * sizeof (usize));
 
-                            render_pixels[render_counts[r2]].x = x;
-                            render_pixels[render_counts[r2]].y = y;
-                            render_pixels[render_counts[r2]].r2 = (f64)r2;
-                            render_counts[r2]++;
-                          }
+                          for (i32 y = 0; y < s.h; ++y)
+                            for (i32 x = 0; x < s.w; ++x)
+                              {
+                                const i32 dx = x - s.mouse_cx;
+                                const i32 dy = y - s.mouse_cy;
+                                const i32 r2 = dx * dx + dy * dy;
+                                render_counts[r2]++;
+                              }
+
+                          usize sum = 0;
+                          for (i32 r = 0; r <= maxr2; ++r)
+                            {
+                              const usize c = render_counts[r];
+                              render_counts[r] = sum;
+                              sum += c;
+                            }
+
+                          for (i32 y = 0; y < s.h; ++y)
+                            for (i32 x = 0; x < s.w; ++x)
+                              {
+                                const i32 dx = x - s.mouse_cx;
+                                const i32 dy = y - s.mouse_cy;
+                                const i32 r2 = dx * dx + dy * dy;
+
+                                render_pixels[render_counts[r2]].x = x;
+                                render_pixels[render_counts[r2]].y = y;
+                                render_pixels[render_counts[r2]].r2 = (f64)r2;
+                                render_counts[r2]++;
+                              }
+                        }
                     }
                 }
 
-              if (gpu_is_available ()
-                  && gpu_should_use (s.w, s.h, s.ss, s.scene->iter_max,
-                                    s.scene->width, s.formula, vibe))
+              if (use_gpu)
                 {
                   struct gpu_view gv;
                   gv.c_re = s.center_re;
@@ -2806,7 +2867,7 @@ main (i32 argc, char **argv)
                   gv.width = s.scene->width;
                   gv.iter_max = s.scene->iter_max;
                   gv.iter_per_color = s.scene->iter_per_color;
-                  gv.ss = s.ss;
+                  gv.ss = s.render_ss;
                   gv.formula = s.formula;
                   gv.omni_a = s.omni_a;
                   gv.bailout = s.scene->bailout;
@@ -2823,9 +2884,21 @@ main (i32 argc, char **argv)
                   gv.delta_c_im = delta_c_im;
                   gv.period_tol = period_tol;
 
-                  gpu_render_mandelbrot (&gv, s.image);
+                  gpu_job_args.view = gv;
+                  gpu_job_args.generation = s.work_generation;
 
-                  atomic_store (&s.tiles_done, n_tiles ());
+                  atomic_store (&gpu_job_active, true);
+
+                  if (thread_pool_enqueue (s.pool, gpu_job, &gpu_job_args) != 0)
+                    {
+                      // The pool is full.  Fall back to the old synchronous
+                      // path instead of silently leaving the image empty.
+                      atomic_store (&gpu_job_active, false);
+
+                      gpu_render_mandelbrot (&gv, s.image);
+
+                      atomic_store (&s.tiles_done, n_tiles ());
+                    }
                 }
               else
                 {
@@ -2857,6 +2930,7 @@ main (i32 argc, char **argv)
                 {
                   auto_iter_update (compute_image_total, vibe);
                   s.phase = PHASE_IDLE;
+
                   break;
                 }
 
@@ -2933,16 +3007,17 @@ main (i32 argc, char **argv)
             }
         }
 
-      // In vibe mode, do not push partially-rendered frames to the canvas:
-      // scaling an incomplete image causes flicker.  Keep the last complete
-      // render until the new one is finished.
-      const bool vibe_upload_ok = !vibe
-        || (s.phase == PHASE_IDLE
-            && atomic_load (&s.tiles_done) == n_tiles ());
+      // A GPU job writes s.image from a worker.  Never upload a frame while
+      // that job is still running: the result is not a coherent image yet.
+      // (CPU renders update the image atomically, so partial frames are safe
+      // to upload and show the expanding circle of progress.)
+      const bool gpu_busy = atomic_load (&gpu_job_active);
+
+      const bool vibe_upload_ok = !gpu_busy;
 
       if (vibe_upload_ok)
         {
-          // Upload texture
+          // Upload texture (atomic per-pixel read, safe for partial frames).
           {
             i32 pitch;
             void *pixels;
