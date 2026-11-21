@@ -165,7 +165,6 @@ static usize render_pixels_cap = 0;
 // must not wait for that job either: it keeps showing the last complete frame.
 static _Atomic bool gpu_job_active;
 static _Atomic bool gpu_vibe_done;
-static _Atomic bool gpu_vibe_inflight;
 
 static usize *render_counts = NULL;
 static usize render_counts_cap = 0;
@@ -280,7 +279,6 @@ terminate (void)
 
   atomic_store (&gpu_job_active, false);
   atomic_store (&gpu_vibe_done, false);
-  atomic_store (&gpu_vibe_inflight, false);
 
   s.phase = PHASE_IDLE;
 
@@ -548,10 +546,7 @@ gpu_job (void *argument)
   if (current)
     gpu_render_mandelbrot (&args->view, args->out ? args->out : s.image);
 
-  if (args->vibe)
-    atomic_store (&gpu_vibe_inflight, false);
-  else
-    atomic_store (&gpu_job_active, false);
+  atomic_store (&gpu_job_active, false);
 
   if (current && args->generation == atomic_load (&s.generation))
     {
@@ -2523,7 +2518,7 @@ main (i32 argc, char **argv)
           // Refresh the underlying render periodically, but never while the
           // background GPU job is in flight: terminating then would block on
           // it.  The GPU completion itself commits the frame.
-          if (vibe_counter % 15 == 0 && !gpu_vibe_inflight)
+          if (vibe_counter % 15 == 0 && !gpu_job_active)
             {
               terminate ();
               s.redraw = true;
@@ -2963,12 +2958,12 @@ main (i32 argc, char **argv)
                   gpu_vibe_job_args.out = gpu_vibe_image;
                   gpu_vibe_job_args.vibe = true;
 
-                  atomic_store (&gpu_vibe_inflight, true);
+                  atomic_store (&gpu_job_active, true);
                   atomic_store (&gpu_vibe_done, false);
 
                   if (thread_pool_enqueue (s.pool, gpu_job, &gpu_vibe_job_args) != 0)
                     {
-                      atomic_store (&gpu_vibe_inflight, false);
+                      atomic_store (&gpu_job_active, false);
                       gpu_render_mandelbrot (&gv, gpu_vibe_image);
                       atomic_store (&gpu_vibe_done, true);
                     }
