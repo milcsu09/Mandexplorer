@@ -448,6 +448,14 @@ fn enqueue_jobs(app: AppState&) {
     }
 }
 
+fn bilerp(c00: u32, c10: u32, c01: u32, c11: u32, tx: f64, ty: f64) -> u32 {
+    fn ch(c: u32, sh: i32) -> f64 { return ((c >> sh) & 0xFF) as f64; }
+    let r = (ch(c00,16)*(1.0-tx) + ch(c10,16)*tx)*(1.0-ty) + (ch(c01,16)*(1.0-tx) + ch(c11,16)*tx)*ty;
+    let g = (ch(c00,8)*(1.0-tx) + ch(c10,8)*tx)*(1.0-ty) + (ch(c01,8)*(1.0-tx) + ch(c11,8)*tx)*ty;
+    let b = (ch(c00,0)*(1.0-tx) + ch(c10,0)*tx)*(1.0-ty) + (ch(c01,0)*(1.0-tx) + ch(c11,0)*tx)*ty;
+    return (0xFF000000 as u32) | ((r as i64) as u32 << 16) | ((g as i64) as u32 << 8) | ((b as i64) as u32);
+}
+
 fn bake_display(app: AppState&) {
     if app.disp_scale == 1.0 && app.disp_pan_x == 0.0 && app.disp_pan_y == 0.0 { return; }
     var out: u32[>..] = [];
@@ -456,12 +464,18 @@ fn bake_display(app: AppState&) {
     let px = app.disp_pan_x / (app.w as f64);
     let py = app.disp_pan_y / (app.h as f64);
     for sy in app.h {
-        let vy = ((sy as f64 + 0.5) / (app.h as f64) - 0.5) / sc + 0.5 + py;
-        let srcy = clamp((vy * (app.h as f64) + 0.5) as i64, 0, app.h - 1);
+        let vy = (((sy as f64 + 0.5) / (app.h as f64) - 0.5) / sc + 0.5 + py) * (app.h as f64) - 0.5;
+        let y0 = clamp(vy as i64, 0, app.h - 1);
+        let y1 = clamp(y0 + 1, 0, app.h - 1);
+        let ty = clamp(vy - (y0 as f64), 0.0, 1.0);
         for sx in app.w {
-            let vx = ((sx as f64 + 0.5) / (app.w as f64) - 0.5) / sc + 0.5 + px;
-            let srcx = clamp((vx * (app.w as f64) + 0.5) as i64, 0, app.w - 1);
-            out[sy * app.w + sx] = app.image[srcy * app.w + srcx];
+            let vx = (((sx as f64 + 0.5) / (app.w as f64) - 0.5) / sc + 0.5 + px) * (app.w as f64) - 0.5;
+            let x0 = clamp(vx as i64, 0, app.w - 1);
+            let x1 = clamp(x0 + 1, 0, app.w - 1);
+            let tx = clamp(vx - (x0 as f64), 0.0, 1.0);
+            out[sy * app.w + sx] = bilerp(
+                app.image[y0 * app.w + x0], app.image[y0 * app.w + x1],
+                app.image[y1 * app.w + x0], app.image[y1 * app.w + x1], tx, ty);
         }
     }
     app.image = copy(out);
@@ -573,7 +587,7 @@ fn main() {
         write_stderr(str("texture fail\n"));
         return;
     }
-    let nearest = gfx::sampler(gfx::NEAREST, gfx::CLAMP);
+    let nearest = gfx::sampler(gfx::LINEAR, gfx::CLAMP);
 
     // Fullscreen quad. uv.y = 0 at screen top, 1 at bottom (matches image rows).
     var qverts: QV[>..] = [];
