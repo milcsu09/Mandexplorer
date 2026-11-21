@@ -10,6 +10,7 @@ import vec;
 
 struct QV { pos: float2, uv: float2 }
 struct ViewP { p: float4 }
+struct RingP { p: float4 }
 
 const LN2: f64 = 0.6931471805599453;
 
@@ -27,7 +28,7 @@ struct Job {
     formula: i32, omni_a: f64, lx: f64, ly: f64, lz: f64,
     color_inside: i32,
     row_start: i64, row_count: i64,
-    mouse_cx: i64, mouse_cy: i64,
+    mouse_cx: i64, mouse_cy: i64, vibe_render: bool,
     delta_c_re: f64, delta_c_im: f64, period_tol: f64,
     palette_size: i64, palette_data: u32[],
     orbit_re: f64[], orbit_im: f64[], has_orbit: bool
@@ -61,7 +62,7 @@ root struct AppState {
     palette: Palette, palette_path: u8[>..],
     gen: u64, rendering: bool, need_redraw: bool,
     pixels_done: i64, pixels_total: i64,
-    mouse_cx: i64, mouse_cy: i64,
+    mouse_cx: i64, mouse_cy: i64, vibe_since_dispatch: i64,
     show_info: bool, show_help: bool,
     auto_iter: bool, auto_state: i32, auto_deep_zoom: bool, vibe: bool,
     period_tol: f64, recording: bool,
@@ -290,7 +291,7 @@ fn render_sorted(job: Job&, y0: i64, count: i64) {
         palette: Palette { size: job.palette_size, data: copy(job.palette_data) },
         palette_path: [],
         gen: job.gen, rendering: false, need_redraw: false,
-        pixels_done: 0, pixels_total: 0, mouse_cx: job.mouse_cx, mouse_cy: job.mouse_cy,
+        pixels_done: 0, pixels_total: 0, mouse_cx: job.mouse_cx, mouse_cy: job.mouse_cy, vibe_since_dispatch: 0,
         show_info: false, show_help: false,
         auto_iter: false, auto_state: 0, auto_deep_zoom: false, vibe: false,
         period_tol: job.period_tol, recording: false,
@@ -307,7 +308,9 @@ fn render_sorted(job: Job&, y0: i64, count: i64) {
         for x in job.w {
             let dx = (x as f64) - cx;
             let dy = (y as f64) - cy;
-            pts.push(Px { x: x, y: y, idx: ((y * job.w + x) as i32), dx2: dx * dx + dy * dy });
+            let r2 = dx * dx + dy * dy;
+            if job.vibe_render && r2 > 250.0 * 250.0 { continue; }
+            pts.push(Px { x: x, y: y, idx: ((y * job.w + x) as i32), dx2: r2 });
         }
     }
     sort(pts) { a, b => a.dx2 < b.dx2 };
@@ -440,7 +443,7 @@ fn enqueue_jobs(app: AppState&) {
             bailout: app.bailout, iter_max: app.iter_max, iter_per_color: app.iter_per_color,
             formula: app.formula, omni_a: app.omni_a, lx: app.lx, ly: app.ly, lz: app.lz,
             color_inside: app.color_inside, row_start: j.y, row_count: j.cnt,
-            mouse_cx: app.mouse_cx, mouse_cy: app.mouse_cy,
+            mouse_cx: app.mouse_cx, mouse_cy: app.mouse_cy, vibe_render: app.vibe,
             delta_c_re: app.delta_c_re, delta_c_im: app.delta_c_im, period_tol: app.period_tol,
             palette_size: app.palette.size, palette_data: copy(app.palette.data),
             orbit_re: copy(app.orbit_re), orbit_im: copy(app.orbit_im), has_orbit: app.orbit_valid
@@ -485,6 +488,7 @@ fn bake_display(app: AppState&) {
 }
 
 fn dispatch_render(app: AppState&) {
+    app.vibe_since_dispatch = 0;
     // Bake the current display transform into both the scene and the image.
     // From here on the committed scene and the displayed pixels agree, and
     // disp starts at identity: new pixels can be written straight into image.
@@ -504,7 +508,19 @@ fn dispatch_render(app: AppState&) {
     for i in app.w * app.h { app.render_buf[i] = app.image[i]; }
     enqueue_jobs(app);
     app.pixels_done = 0;
-    app.pixels_total = app.w * app.h;
+    if app.vibe {
+        var n: i64 = 0;
+        for y in app.h {
+            let dy = (y as f64) - (app.mouse_cy as f64);
+            for x in app.w {
+                let dx = (x as f64) - (app.mouse_cx as f64);
+                if dx * dx + dy * dy <= 250.0 * 250.0 { n = n + 1; }
+            }
+        }
+        app.pixels_total = n;
+    } else {
+        app.pixels_total = app.w * app.h;
+    }
     app.rendering = true;
     app.need_redraw = false;
 }
@@ -554,7 +570,7 @@ fn main() {
         delta_c_re: 0.0, delta_c_im: 0.0,
         palette: Palette { size: 0, data: [] }, palette_path: [],
         gen: 0, rendering: false, need_redraw: false,
-        pixels_done: 0, pixels_total: 0, mouse_cx: 400, mouse_cy: 300,
+        pixels_done: 0, pixels_total: 0, mouse_cx: 400, mouse_cy: 300, vibe_since_dispatch: 0,
         show_info: true, show_help: false,
         auto_iter: false, auto_state: 0, auto_deep_zoom: false, vibe: false,
         period_tol: 1e-40, recording: false,
@@ -608,11 +624,18 @@ fn main() {
     let quad_fs = embed_shader("frag", """
         layout(set = 2, binding = 0) uniform sampler2D tex;
         layout(set = 3, binding = 0) uniform View { vec4 p; };
+        layout(set = 3, binding = 1) uniform Ring { vec4 r; };
+        layout(set = 3, binding = 2) uniform Aspect { vec4 a; };
         layout(location = 0) in vec2 v_uv;
         layout(location = 0) out vec4 result;
         void main() {
             vec2 uv = (v_uv - vec2(0.5)) / p.x + vec2(0.5) + p.yz;
             result = texture(tex, uv);
+            if (r.w > 0.5) {
+                vec2 d = (v_uv - r.xy) * vec2(1.0, a.x);
+                float dist = length(d);
+                if (abs(dist - r.z) < 0.0035) result.rgb = vec3(1.0, 0.45, 0.0);
+            }
         }
         """);
     var qdesc = gfx::PipelineDesc { };
@@ -748,6 +771,7 @@ fn main() {
 
         // ---- vibe zoom: transform the last complete frame, never block ----
         if app.vibe {
+            app.vibe_since_dispatch += 1;
             let mp = gfx::mouse_pos();
             let sx = mp.x as f64 - (app.w as f64) / 2.0;
             let sy = mp.y as f64 - (app.h as f64) / 2.0;
@@ -758,7 +782,7 @@ fn main() {
             app.disp_pan_y = wy - sy / app.disp_scale;
         }
 
-        if app.need_redraw && !app.rendering { dispatch_render(app); }
+        if app.need_redraw && !app.rendering && (!app.vibe || app.vibe_since_dispatch >= 15) { dispatch_render(app); }
 
         // ---- recording ----
         if app.recording {
@@ -793,6 +817,19 @@ fn main() {
             (app.disp_pan_x / (app.w as f64)) as f32,
             (app.disp_pan_y / (app.h as f64)) as f32,
             0.0 as f32 } });
+        var ring_active: f32 = 0.0;
+        var ring_r: f32 = 0.0;
+        if app.vibe && app.rendering && app.pixels_total > 0 {
+            ring_active = 1.0;
+            let frac = (app.pixels_done as f64) / (app.pixels_total as f64);
+            ring_r = (250.0 * sqrt(frac) / (app.w as f64)) as f32;
+        }
+        gfx::uniforms(gfx::FRAGMENT, 1, RingP { p: float4 {
+            (app.mouse_cx as f64 / (app.w as f64)) as f32,
+            (app.mouse_cy as f64 / (app.h as f64)) as f32,
+            ring_r, ring_active } });
+        gfx::uniforms(gfx::FRAGMENT, 2, RingP { p: float4 {
+            (app.h as f64 / (app.w as f64)) as f32, 0.0 as f32, 0.0 as f32, 0.0 as f32 } });
         gfx::bind_vertex_buffer(qvb);
         gfx::draw(3);
         gfx::end_pass();
@@ -842,7 +879,7 @@ fn main() {
             center_re: 0.0, center_im: 0.0, width: 0.0, bailout: 0.0,
             iter_max: 0, iter_per_color: 0, formula: 0, omni_a: 0.0,
             lx: 0.0, ly: 0.0, lz: 0.0, color_inside: 0,
-            row_start: -1, row_count: 0, mouse_cx: 0, mouse_cy: 0,
+            row_start: -1, row_count: 0, mouse_cx: 0, mouse_cy: 0, vibe_render: false,
             delta_c_re: 0.0, delta_c_im: 0.0, period_tol: 0.0,
             palette_size: 0, palette_data: [],
             orbit_re: [], orbit_im: [], has_orbit: false
