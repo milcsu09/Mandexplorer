@@ -27,13 +27,18 @@ struct Job {
     formula: i32, omni_a: f64, lx: f64, ly: f64, lz: f64,
     color_inside: i32,
     row_start: i64, row_count: i64,
+    mouse_cx: i64, mouse_cy: i64,
     delta_c_re: f64, delta_c_im: f64, period_tol: f64,
     palette_size: i64, palette_data: u32[],
     orbit_re: f64[], orbit_im: f64[], has_orbit: bool
 }
 
-// Flat result returned by a worker. row_start < 0 marks a quit job.
-struct RowResult { gen: u64, y: i64, pixels: u32[] }
+// Flat result: a batch of pixels rendered in distance-from-mouse order.
+// The main thread scatters them into the displayed image so the fresh
+// pixels expand as a circle around the cursor (as in the original C build).
+struct PixResult { gen: u64, indices: i32[], colors: u32[] }
+struct Px { x: i64, y: i64, idx: i32, dx2: f64 }
+struct RowJob { y: i64, cnt: i64, r2: f64 }
 
 root struct AppState {
     // committed scene view (what the in-flight render is for)
@@ -55,7 +60,8 @@ root struct AppState {
     delta_c_re: f64, delta_c_im: f64,
     palette: Palette, palette_path: u8[>..],
     gen: u64, rendering: bool, need_redraw: bool,
-    rows_done: i64, rows_total: i64,
+    pixels_done: i64, pixels_total: i64,
+    mouse_cx: i64, mouse_cy: i64,
     show_info: bool, show_help: bool,
     auto_iter: bool, auto_state: i32, auto_deep_zoom: bool, vibe: bool,
     period_tol: f64, recording: bool,
@@ -264,7 +270,10 @@ fn pixel_color(app: AppState&, dx: f64, dy: f64) -> u32 {
     return (0xFF000000 as u32) | ((r as i64) as u32 << 16) | ((g as i64) as u32 << 8) | ((b as i64) as u32);
 }
 
-fn render_rows(job: Job&, y0: i64, count: i64) -> u32[] {
+// Render a job's rows, but walk the pixels in increasing distance from the
+// mouse and stream them back in small batches.  The display thread scatters
+// each batch into the visible image, producing the expanding circle.
+fn render_sorted(job: Job&, y0: i64, count: i64) {
     var pa = AppState {
         c_re: job.center_re, c_im: job.center_im, view_width: job.width,
         bailout: job.bailout, lx: job.lx, ly: job.ly, lz: job.lz,
@@ -281,48 +290,63 @@ fn render_rows(job: Job&, y0: i64, count: i64) -> u32[] {
         palette: Palette { size: job.palette_size, data: copy(job.palette_data) },
         palette_path: [],
         gen: job.gen, rendering: false, need_redraw: false,
-        rows_done: 0, rows_total: 0,
+        pixels_done: 0, pixels_total: 0, mouse_cx: job.mouse_cx, mouse_cy: job.mouse_cy,
         show_info: false, show_help: false,
         auto_iter: false, auto_state: 0, auto_deep_zoom: false, vibe: false,
         period_tol: job.period_tol, recording: false,
         tex: gfx::Texture { id: 0 }, worker_ids: []
     };
-    var pixels: u32[>..] = [];
-    pixels.resize(job.w * count, 0);
-    let ss = job.ss;
+
+    // Build this worker's slice of pixels, sorted by distance from the mouse.
+    var pts: Px[>..] = [];
+    let cx = job.mouse_cx as f64;
+    let cy = job.mouse_cy as f64;
     for ry in count {
         let y = y0 + ry;
+        if y >= job.h { break; }
         for x in job.w {
-            var r: u32 = 0; var g: u32 = 0; var b: u32 = 0;
-            for sy in ss {
-                for sx in ss {
-                    let fx = (x as f64) + (sx as f64 + 0.5) / (ss as f64);
-                    let fy = (y as f64) + (sy as f64 + 0.5) / (ss as f64);
-                    let dx = (fx - (job.w as f64) / 2.0) * job.width / (job.w as f64);
-                    let dy = ((job.h as f64) / 2.0 - fy) * job.width / (job.w as f64);
-                    let col = pixel_color(pa, dx, dy);
-                    r += (col >> 16) & 0xFF;
-                    g += (col >> 8) & 0xFF;
-                    b += col & 0xFF;
-                }
-            }
-            let n = (ss * ss) as u32;
-            pixels[ry * job.w + x] = (((r / n) & 0xFF) << 16) | (((g / n) & 0xFF) << 8) | ((b / n) & 0xFF) | (0xFF000000 as u32);
+            let dx = (x as f64) - cx;
+            let dy = (y as f64) - cy;
+            pts.push(Px { x: x, y: y, idx: ((y * job.w + x) as i32), dx2: dx * dx + dy * dy });
         }
     }
-    return pixels;
+    sort(pts) { a, b => a.dx2 < b.dx2 };
+
+    let ss = job.ss;
+    var idxs: i32[>..] = [];
+    var cols: u32[>..] = [];
+    for p in pts {
+        var r: u32 = 0; var g: u32 = 0; var b: u32 = 0;
+        for sy in ss {
+            for sx in ss {
+                let fx = (p.x as f64) + (sx as f64 + 0.5) / (ss as f64);
+                let fy = (p.y as f64) + (sy as f64 + 0.5) / (ss as f64);
+                let dx = (fx - (job.w as f64) / 2.0) * job.width / (job.w as f64);
+                let dy = ((job.h as f64) / 2.0 - fy) * job.width / (job.w as f64);
+                let col = pixel_color(pa, dx, dy);
+                r += (col >> 16) & 0xFF;
+                g += (col >> 8) & 0xFF;
+                b += col & 0xFF;
+            }
+        }
+        let n = (ss * ss) as u32;
+        idxs.push(p.idx);
+        cols.push((((r / n) & 0xFF) << 16) | (((g / n) & 0xFF) << 8) | ((b / n) & 0xFF) | (0xFF000000 as u32));
+        if idxs.len >= 256 {
+            qput(PixResult { gen: job.gen, indices: copy(idxs), colors: copy(cols) });
+            idxs.clear(); cols.clear();
+        }
+    }
+    if idxs.len > 0 {
+        qput(PixResult { gen: job.gen, indices: copy(idxs), colors: copy(cols) });
+    }
 }
 
 thread_fn worker() {
     loop {
         let job = qget<Job>();
         if job.row_start < 0 { break; }
-        for r in job.row_count {
-            let y = job.row_start + r;
-            if y >= job.h { break; }
-            let px = render_rows(job, y, 1);
-            qput(RowResult { gen: job.gen, y: y, pixels: copy(px) });
-        }
+        render_sorted(job, job.row_start, job.row_count);
     }
 }
 
@@ -396,59 +420,79 @@ fn save_scene(path: const u8[:], app: AppState&) -> bool {
 }
 
 fn enqueue_jobs(app: AppState&) {
+    // Enqueue row bands in order of distance from the mouse, so workers pick
+    // up the nearest bands first and the visible fill expands as a circle.
     let rows_per_job = 8;
+    var jobs: RowJob[>..] = [];
     var y = 0;
     while y < app.h {
         let cnt = if y + rows_per_job < app.h { rows_per_job } else { app.h - y };
+        let dy = ((y as f64) + (cnt as f64) / 2.0) - (app.mouse_cy as f64);
+        let dx = (app.w as f64) / 2.0 - (app.mouse_cx as f64);
+        jobs.push(RowJob { y: y, cnt: cnt, r2: dx * dx + dy * dy });
+        y = y + cnt;
+    }
+    sort(jobs) { a, b => a.r2 < b.r2 };
+    for j in jobs {
         qput(Job {
             gen: app.gen, w: app.w, h: app.h, ss: app.ss,
             center_re: app.c_re, center_im: app.c_im, width: app.view_width,
             bailout: app.bailout, iter_max: app.iter_max, iter_per_color: app.iter_per_color,
             formula: app.formula, omni_a: app.omni_a, lx: app.lx, ly: app.ly, lz: app.lz,
-            color_inside: app.color_inside, row_start: y, row_count: cnt,
+            color_inside: app.color_inside, row_start: j.y, row_count: j.cnt,
+            mouse_cx: app.mouse_cx, mouse_cy: app.mouse_cy,
             delta_c_re: app.delta_c_re, delta_c_im: app.delta_c_im, period_tol: app.period_tol,
             palette_size: app.palette.size, palette_data: copy(app.palette.data),
             orbit_re: copy(app.orbit_re), orbit_im: copy(app.orbit_im), has_orbit: app.orbit_valid
         });
-        y = y + cnt;
     }
 }
 
-fn dispatch_render(app: AppState&) {
-    // The view to render is the committed scene as seen through the display
-    // transform. Remember both so the transform can be rebased when the frame
-    // completes; do not touch c.. or disp here, otherwise the last complete
-    // frame would jump on screen.
-    let w = app.w as f64;
-    app.pend_re = app.c_re + app.disp_pan_x * app.view_width / w;
-    app.pend_im = app.c_im - app.disp_pan_y * app.view_width / w;
-    app.pend_width = app.view_width / app.disp_scale;
-    app.pend_valid = true;
-    app.snap_scale = app.disp_scale;
-    app.snap_pan_x = app.disp_pan_x;
-    app.snap_pan_y = app.disp_pan_y;
+fn bake_display(app: AppState&) {
+    if app.disp_scale == 1.0 && app.disp_pan_x == 0.0 && app.disp_pan_y == 0.0 { return; }
+    var out: u32[>..] = [];
+    out.resize(app.w * app.h, 0xFF000000 as u32);
+    let sc = app.disp_scale;
+    let px = app.disp_pan_x / (app.w as f64);
+    let py = app.disp_pan_y / (app.h as f64);
+    for sy in app.h {
+        let vy = ((sy as f64 + 0.5) / (app.h as f64) - 0.5) / sc + 0.5 + py;
+        let srcy = clamp((vy * (app.h as f64) + 0.5) as i64, 0, app.h - 1);
+        for sx in app.w {
+            let vx = ((sx as f64 + 0.5) / (app.w as f64) - 0.5) / sc + 0.5 + px;
+            let srcx = clamp((vx * (app.w as f64) + 0.5) as i64, 0, app.w - 1);
+            out[sy * app.w + sx] = app.image[srcy * app.w + srcx];
+        }
+    }
+    app.image = copy(out);
+    app.disp_scale = 1.0;
+    app.disp_pan_x = 0.0;
+    app.disp_pan_y = 0.0;
+}
 
-    // Render the target view: temporarily swap it into the committed scene.
-    let save_re = app.c_re; let save_im = app.c_im; let save_w = app.view_width;
-    let save_valid = app.orbit_valid;
-    let save_ore = copy(app.orbit_re); let save_oim = copy(app.orbit_im);
-    app.c_re = app.pend_re; app.c_im = app.pend_im; app.view_width = app.pend_width;
-    app.orbit_valid = false;
+fn dispatch_render(app: AppState&) {
+    // Bake the current display transform into both the scene and the image.
+    // From here on the committed scene and the displayed pixels agree, and
+    // disp starts at identity: new pixels can be written straight into image.
+    let w = app.w as f64;
+    app.c_re += app.disp_pan_x * app.view_width / w;
+    app.c_im -= app.disp_pan_y * app.view_width / w;
+    app.view_width /= app.disp_scale;
+    bake_display(app);
+
+    let mp = gfx::mouse_pos();
+    app.mouse_cx = mp.x as i64;
+    app.mouse_cy = mp.y as i64;
 
     app.gen = app.gen + 1;
     compute_orbit(app);
-    app.render_buf.resize(app.w * app.h, 0);
+    app.render_buf.resize(app.w * app.h, 0xFF000000 as u32);
+    for i in app.w * app.h { app.render_buf[i] = app.image[i]; }
     enqueue_jobs(app);
-    app.rows_done = 0;
-    app.rows_total = app.h;
+    app.pixels_done = 0;
+    app.pixels_total = app.w * app.h;
     app.rendering = true;
     app.need_redraw = false;
-
-    // Restore the committed scene: the displayed frame is still for the old
-    // view, transformed by disp.
-    app.c_re = save_re; app.c_im = save_im; app.view_width = save_w;
-    app.orbit_valid = save_valid;
-    app.orbit_re = copy(save_ore); app.orbit_im = copy(save_oim);
 }
 
 // Bake the accumulated vibe display transform into the committed scene and
@@ -496,7 +540,7 @@ fn main() {
         delta_c_re: 0.0, delta_c_im: 0.0,
         palette: Palette { size: 0, data: [] }, palette_path: [],
         gen: 0, rendering: false, need_redraw: false,
-        rows_done: 0, rows_total: 0,
+        pixels_done: 0, pixels_total: 0, mouse_cx: 400, mouse_cy: 300,
         show_info: true, show_help: false,
         auto_iter: false, auto_state: 0, auto_deep_zoom: false, vibe: false,
         period_tol: 1e-40, recording: false,
@@ -667,35 +711,23 @@ fn main() {
         if app.rendering {
             var more = true;
             while more {
-                let res, ok = qpoll<RowResult>();
+                let res, ok = qpoll<PixResult>();
                 if !ok { more = false; break; }
                 if res.gen != app.gen { continue; }
-                if res.y >= 0 && res.y < app.h {
-                    for x in app.w {
-                        let idx = res.y * app.w + x;
-                        if idx >= 0 && idx < app.render_buf.len && x < res.pixels.len {
-                            app.render_buf[idx] = res.pixels[x];
-                        }
+                for i in res.indices.len {
+                    let idx = res.indices[i];
+                    if idx >= 0 && idx < app.image.len {
+                        // Write straight into the visible image: finished
+                        // pixels expand as a circle around the cursor while
+                        // unfinished pixels still show the previous frame.
+                        app.image[idx] = res.colors[i];
+                        app.render_buf[idx] = res.colors[i];
                     }
-                    app.rows_done += 1;
                 }
+                app.pixels_done += res.indices.len;
             }
-            if app.rows_done >= app.rows_total {
+            if app.pixels_done >= app.pixels_total {
                 app.rendering = false;
-                if app.pend_valid {
-                    // Rebase the display transform from the old frame's scene
-                    // to the just-completed frame's scene, so the view on
-                    // screen does not jump.
-                    if app.snap_scale > 0.0 {
-                        let ns = app.disp_scale / app.snap_scale;
-                        let npx = (app.disp_pan_x - app.snap_pan_x) * app.snap_scale;
-                        let npy = (app.disp_pan_y - app.snap_pan_y) * app.snap_scale;
-                        app.c_re = app.pend_re; app.c_im = app.pend_im;
-                        app.view_width = app.pend_width;
-                        app.disp_scale = ns; app.disp_pan_x = npx; app.disp_pan_y = npy;
-                    }
-                    for i in app.w * app.h { app.image[i] = app.render_buf[i]; }
-                }
                 if app.vibe { app.need_redraw = true; }
             }
         }
@@ -796,7 +828,7 @@ fn main() {
             center_re: 0.0, center_im: 0.0, width: 0.0, bailout: 0.0,
             iter_max: 0, iter_per_color: 0, formula: 0, omni_a: 0.0,
             lx: 0.0, ly: 0.0, lz: 0.0, color_inside: 0,
-            row_start: -1, row_count: 0,
+            row_start: -1, row_count: 0, mouse_cx: 0, mouse_cy: 0,
             delta_c_re: 0.0, delta_c_im: 0.0, period_tol: 0.0,
             palette_size: 0, palette_data: [],
             orbit_re: [], orbit_im: [], has_orbit: false
