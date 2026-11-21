@@ -17,6 +17,7 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - x: reset view. c: center on mouse.
 - Insert/Delete: bailout ±. Home/End: iter_max ±. PgUp/PgDn: iter per color.
 - s: save .sce. 1/2/4/8: SSAA.
+- r: record video (press to start, press again to stop and render mp4).
 - `.` / `,`: period detection tolerance up/down (1e-61 disables → "off").
 
 ## Period detection

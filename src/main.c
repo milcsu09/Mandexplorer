@@ -1,3 +1,7 @@
+#define _POSIX_C_SOURCE 200809L
+
+#include <signal.h>
+
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 #include <mpfr.h>
@@ -11,6 +15,7 @@
 #include "palette.h"
 #include "scene.h"
 #include "thread_pool.h"
+#include "gpu.h"
 
 
 /// General configuration
@@ -25,6 +30,19 @@
 
 // Omnibrot: z <- z^2 * exp (a / z) + c
 #define OMNIBROT_A_DEFAULT 0.005
+
+#define ORBIT_REUSE_EPS       1e-3
+#define ORBIT_REUSE_MIN_WIDTH 1e-10
+
+#define VIDEO_FIT_MAX_ATTEMPTS    3
+#define VIDEO_FIT_SHRINK_FACTOR   4
+#define VIDEO_FIT_MIN_SHRINK      64
+#define VIDEO_FIT_PROBE_DEADLINE  500
+#define VIDEO_FIT_PROBE_MIN_SAMP  128
+#define VIDEO_FIT_SENS_LO         0.005
+
+#define KEYFRAME_MAX_REUSE     5
+#define KEYFRAME_MAX_MAG       1.5
 
 // Adaptive iteration control.
 //
@@ -69,13 +87,6 @@ enum auto_iter_state
 };
 
 
-enum formula
-{
-  FORMULA_MANDELBROT,
-  FORMULA_OMNIBROT,
-};
-
-
 static struct
 {
   struct scene *scene;
@@ -84,6 +95,13 @@ static struct
 
   i32 w;
   i32 h;
+
+  i32 sectors;
+
+  i32 mouse_cx;
+  i32 mouse_cy;
+
+  bool vibe;
 
   SDL_Window *window;
   SDL_Renderer *renderer;
@@ -106,6 +124,7 @@ static struct
   f64 *orbit_im;
 
   i32 ss;
+  i32 ss_prev;
 
   f64 pan_x;
   f64 pan_y;
@@ -133,6 +152,14 @@ static struct
 } s;
 
 
+static struct point *render_pixels = NULL;
+static usize render_pixel_count = 0;
+static usize render_pixels_cap = 0;
+
+static usize *render_counts = NULL;
+static usize render_counts_cap = 0;
+
+
 // Probe snapshot.  It is filled when a render starts and is only read by the
 // probe job after that render has finished.
 static _Atomic bool probe_done;
@@ -148,6 +175,9 @@ static f64 probe_omni_a;
 
 static u64 probe_iter;
 static u64 probe_iter_per_color;
+
+static u64 probe_deadline_ms = PROBE_DEADLINE_MS;
+static u64 probe_min_samples = PROBE_MIN_SAMPLES;
 
 static i32 probe_screen_w;
 static i32 probe_screen_h;
@@ -167,6 +197,66 @@ static f64 period_tol = 1e-40;
 // is visible.  b toggles it.
 static bool color_inside = true;
 
+struct orbit_cache
+{
+  bool valid;
+  u64 iter_max;
+  mpfr_t c_re;
+  mpfr_t c_im;
+  f64 c_re_d;
+  f64 c_im_d;
+};
+
+static struct orbit_cache orbit_cache;
+static f64 delta_c_re = 0.0;
+static f64 delta_c_im = 0.0;
+
+static struct image *keyframe_image = NULL;
+static struct view_state keyframe_view;
+static bool has_keyframe = false;
+static bool keyframe_pending = false;
+static usize keyframe_render_index = 0;
+
+
+// Recording mode state.
+
+struct view_state
+{
+  f64 c_re;
+  f64 c_im;
+  f64 width;
+
+  u64 iter_max;
+  u64 recorded_iter_max;
+  u64 iter_per_color;
+
+  i32 ss;
+
+  enum formula formula;
+
+  f64 omni_a;
+  f64 bailout;
+
+  f64 lx;
+  f64 ly;
+  f64 lz;
+
+  bool color_inside;
+};
+
+
+static struct view_state *recorded_views = NULL;
+static usize recorded_count = 0;
+static usize recorded_cap = 0;
+
+static bool recording = false;
+static bool rendering_video = false;
+static bool video_frame_pending = false;
+static usize render_index = 0;
+
+static FILE *ffmpeg_pipe = NULL;
+static char video_path[256] = { 0 };
+
 
 void
 terminate (void)
@@ -185,12 +275,231 @@ terminate (void)
 }
 
 
+static void
+probe_job (void *argument);
+
+static bool
+can_reuse_keyframe (const struct view_state *kv, const struct view_state *v);
+
+static void
+warp_keyframe (const struct view_state *kv, const struct view_state *v);
+
+static u32
+bilinear_sample (const struct image *img, f64 x, f64 y);
+
+static void
+start_render_phase (void)
+{
+  rendering_video = true;
+  render_index = 0;
+  video_frame_pending = false;
+  has_keyframe = false;
+  keyframe_pending = false;
+  keyframe_render_index = 0;
+
+  time_t raw_time;
+  struct tm *time_info;
+
+  time (&raw_time);
+  time_info = localtime (&raw_time);
+
+  strftime (video_path, sizeof video_path, "%Y%m%d_%H%M%S.mp4", time_info);
+
+  char cmd[2048];
+
+  snprintf (cmd, sizeof cmd,
+            "ffmpeg -y -hide_banner -loglevel error "
+            "-f rawvideo -pix_fmt rgb24 -s %dx%d -r 30 -i - "
+            "-c:v libx264 -pix_fmt yuv444p -preset fast "
+            "\"%s\"",
+            s.w, s.h, video_path);
+
+  ffmpeg_pipe = popen (cmd, "w");
+
+  if (!ffmpeg_pipe)
+    {
+      fprintf (stderr, "Failed to start ffmpeg\n");
+      rendering_video = false;
+    }
+  else
+    {
+      printf ("Rendering %zu recorded frames to '%s'\n",
+              recorded_count, video_path);
+    }
+}
+
+
+static u64
+fit_video_n (struct view_state *v)
+{
+  const u64 recorded = v->iter_max;
+
+  u64 min_n = recorded / VIDEO_FIT_MIN_SHRINK;
+  const u64 color_floor = v->iter_per_color * 4;
+  if (min_n < color_floor)
+    min_n = color_floor;
+  if (min_n < 1)
+    min_n = 1;
+
+  u64 n = recorded;
+
+  s.work_generation = atomic_load (&s.generation);
+
+  const u64 saved_deadline = probe_deadline_ms;
+  const u64 saved_min_samples = probe_min_samples;
+  probe_deadline_ms = VIDEO_FIT_PROBE_DEADLINE;
+  probe_min_samples = VIDEO_FIT_PROBE_MIN_SAMP;
+
+  for (int attempt = 0; attempt < VIDEO_FIT_MAX_ATTEMPTS; ++attempt)
+    {
+      probe_iter = n;
+      probe_iter_per_color = v->iter_per_color;
+      probe_center_re = v->c_re;
+      probe_center_im = v->c_im;
+      probe_width = v->width;
+      probe_bailout2 = v->bailout * v->bailout;
+      probe_omni_a = v->omni_a;
+      probe_screen_w = s.w;
+      probe_screen_h = s.h;
+      probe_formula = v->formula;
+
+      probe_changed = 0;
+      probe_total = 0;
+      atomic_store (&probe_done, false);
+
+      probe_job (NULL);
+
+      if (probe_total < probe_min_samples)
+        break;
+
+      const f64 sens = (f64)probe_changed / (f64)probe_total;
+
+      if (sens >= VIDEO_FIT_SENS_LO)
+        break;
+
+      u64 next = n / VIDEO_FIT_SHRINK_FACTOR;
+      if (next < min_n)
+        next = min_n;
+      if (next >= n)
+        break;
+
+      n = next;
+    }
+
+  probe_deadline_ms = saved_deadline;
+  probe_min_samples = saved_min_samples;
+
+  return n;
+}
+
+
+static bool
+can_reuse_keyframe (const struct view_state *kv, const struct view_state *v)
+{
+  if (kv->formula != v->formula) return false;
+  if (kv->recorded_iter_max != v->recorded_iter_max) return false;
+  if (kv->iter_per_color != v->iter_per_color) return false;
+  if (kv->ss != v->ss) return false;
+  if (kv->color_inside != v->color_inside) return false;
+  if (kv->omni_a != v->omni_a) return false;
+  if (kv->bailout != v->bailout) return false;
+  if (kv->lx != v->lx) return false;
+  if (kv->ly != v->ly) return false;
+  if (kv->lz != v->lz) return false;
+
+  const f64 S = v->width / kv->width;
+  const f64 Dx = v->c_re - kv->c_re;
+  const f64 Dy = v->c_im - kv->c_im;
+
+  const f64 cx = (s.w / 2.0) * (1.0 - S) + Dx * s.w / kv->width;
+  const f64 cy = (s.h / 2.0) * (1.0 - S) - Dy * s.w / kv->width;
+
+  if (cx < 0 || (f64)s.w * S + cx > (f64)s.w - 1) return false;
+  if (cy < 0 || (f64)s.h * S + cy > (f64)s.h - 1) return false;
+
+  if (S < 1.0 / KEYFRAME_MAX_MAG) return false;
+
+  if (render_index - keyframe_render_index >= KEYFRAME_MAX_REUSE) return false;
+
+  return true;
+}
+
+
+static u32
+bilinear_sample (const struct image *img, f64 x, f64 y)
+{
+  const i32 W = img->w;
+  const i32 H = img->h;
+
+  if (x < 0) x = 0;
+  if (y < 0) y = 0;
+  if (x > W - 1) x = W - 1;
+  if (y > H - 1) y = H - 1;
+
+  const i32 x0 = (i32)x;
+  const i32 y0 = (i32)y;
+  const i32 x1 = imin (x0 + 1, W - 1);
+  const i32 y1 = imin (y0 + 1, H - 1);
+
+  const f64 fx = x - x0;
+  const f64 fy = y - y0;
+
+  const u32 c00 = image_get2 (img, x0, y0);
+  const u32 c10 = image_get2 (img, x1, y0);
+  const u32 c01 = image_get2 (img, x0, y1);
+  const u32 c11 = image_get2 (img, x1, y1);
+
+  const f64 r00 = color_r (c00), g00 = color_g (c00), b00 = color_b (c00);
+  const f64 r10 = color_r (c10), g10 = color_g (c10), b10 = color_b (c10);
+  const f64 r01 = color_r (c01), g01 = color_g (c01), b01 = color_b (c01);
+  const f64 r11 = color_r (c11), g11 = color_g (c11), b11 = color_b (c11);
+
+  const f64 w00 = (1 - fx) * (1 - fy);
+  const f64 w10 = fx * (1 - fy);
+  const f64 w01 = (1 - fx) * fy;
+  const f64 w11 = fx * fy;
+
+  return color_rgb (
+    (u8)(r00*w00 + r10*w10 + r01*w01 + r11*w11 + 0.5),
+    (u8)(g00*w00 + g10*w10 + g01*w01 + g11*w11 + 0.5),
+    (u8)(b00*w00 + b10*w10 + b01*w01 + b11*w11 + 0.5)
+  );
+}
+
+
+static void
+warp_keyframe (const struct view_state *kv, const struct view_state *v)
+{
+  const f64 S = v->width / kv->width;
+  const f64 Dx = v->c_re - kv->c_re;
+  const f64 Dy = v->c_im - kv->c_im;
+
+  const f64 cx = (s.w / 2.0) * (1.0 - S) + Dx * s.w / kv->width;
+  const f64 cy = (s.h / 2.0) * (1.0 - S) - Dy * s.w / kv->width;
+
+  for (i32 y = 0; y < s.h; ++y)
+    {
+      const f64 ky = y * S + cy;
+
+      for (i32 x = 0; x < s.w; ++x)
+        {
+          const f64 kx = x * S + cx;
+
+          const u32 c = bilinear_sample (keyframe_image, kx, ky);
+
+          image_set2 (s.image, x, y, c);
+        }
+    }
+}
+
+
 i32
 n_tiles (void)
 {
-  const i32 tiles_amount_x = (s.w + TILE_SIZE - 1) / TILE_SIZE;
-  const i32 tiles_amount_y = (s.h + TILE_SIZE - 1) / TILE_SIZE;
-  return tiles_amount_x * tiles_amount_y;
+  if (s.sectors < 1)
+    return 4;
+
+  return s.sectors;
 }
 
 
@@ -208,6 +517,8 @@ apply_iter_max (u64 iter_max)
 
   if (iter_max == s.scene->iter_max)
     return false;
+
+  orbit_cache.valid = false;
 
   f64 *orbit_re = calloc (iter_max + 1, sizeof (f64));
   f64 *orbit_im = calloc (iter_max + 1, sizeof (f64));
@@ -241,6 +552,8 @@ void
 compute_orbit (void *argument)
 {
   (void)argument;
+
+  orbit_cache.valid = false;
 
   if (s.formula == FORMULA_OMNIBROT)
     {
@@ -283,6 +596,13 @@ compute_orbit (void *argument)
     }
 
   mpfr_clears (two, z_re, z_im, z_re_new, t, (mpfr_ptr)NULL);
+
+  mpfr_set (orbit_cache.c_re, s.scene->c_re, MPFR_RNDN);
+  mpfr_set (orbit_cache.c_im, s.scene->c_im, MPFR_RNDN);
+  orbit_cache.c_re_d = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
+  orbit_cache.c_im_d = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
+  orbit_cache.iter_max = s.scene->iter_max;
+  orbit_cache.valid = true;
 
   atomic_store (&s.orbit_ready, true);
 }
@@ -351,6 +671,9 @@ omnibrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
 
   for (u64 iter = 0; iter < s.scene->iter_max; ++iter)
     {
+      if (s.work_generation != atomic_load (&s.generation))
+        return 0.0;
+
       const f64 den = z_re * z_re + z_im * z_im;
 
       if (!(den > 0.0))
@@ -602,7 +925,7 @@ probe_job (void *argument)
           if (s.work_generation != atomic_load (&s.generation))
             return;
 
-          if (SDL_GetTicks () - probe_start >= PROBE_DEADLINE_MS)
+          if (SDL_GetTicks () - probe_start >= probe_deadline_ms)
             {
               deadline_hit = true;
               break;
@@ -652,7 +975,7 @@ probe_job (void *argument)
         }
     }
 
-  if (total < PROBE_MIN_SAMPLES)
+  if (total < probe_min_samples)
     {
       // Too few samples for a trustworthy decision (usually a very high N
       // combined with the deadline).  Hold the current iteration count.
@@ -838,6 +1161,10 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
       return s.scene->iter_max;
     }
 
+  // Adjust perturbation delta when reusing a cached reference orbit.
+  delta_re += delta_c_re;
+  delta_im += delta_c_im;
+
   u64 iter = 0;
   u64 iter_orbit = 0;
 
@@ -857,6 +1184,9 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
 
   while (iter < s.scene->iter_max)
     {
+      if (s.work_generation != atomic_load (&s.generation))
+        return 0.0;
+
       f64 r_re;
       f64 r_im;
 
@@ -989,10 +1319,18 @@ mandelbrot_shade (f64 nx, f64 ny)
 /// Work
 
 
-struct work
+struct point
 {
   i32 x;
   i32 y;
+  f64 r2;
+};
+
+
+struct work
+{
+  usize offset;
+  usize stride;
 };
 
 
@@ -1006,54 +1344,62 @@ worker (void *argument)
 
   const f64 scale = s.scene->width / s.w;
 
-  for (i32 y = work->y; y < work->y + TILE_SIZE && y < s.h; ++y)
-    for (i32 x = work->x; x < work->x + TILE_SIZE && x < s.w; ++x)
-      {
-        if (s.work_generation != atomic_load (&s.generation))
-          return;
+  const usize offset = work->offset;
+  const usize stride = work->stride;
+  const usize total = render_pixel_count;
 
-        u64 r = 0, g = 0, b = 0;
+  for (usize i = offset; i < total; i += stride)
+    {
+      if (s.work_generation != atomic_load (&s.generation))
+        return;
 
-        for (i32 sy = 0; sy < s.ss; ++sy)
-          for (i32 sx = 0; sx < s.ss; ++sx)
-            {
-              if (s.work_generation != atomic_load (&s.generation))
-                return;
+      if (s.vibe && render_pixels[i].r2 > 250.0 * 250.0)
+        continue;
 
-              const f64 dx = (x - s.w / 2.0 + (sx + 0.5) * sample) * scale;
-              const f64 dy = (s.h / 2.0 - y - (sy + 0.5) * sample) * scale;
+      const i32 x = render_pixels[i].x;
+      const i32 y = render_pixels[i].y;
 
-              f64 nx, ny;
-              f64 nu = mandelbrot (dx, dy, &nx, &ny);
+      u64 r = 0, g = 0, b = 0;
 
-              if (nu >= s.scene->iter_max)
-                {
-                  if (color_inside && s.scene->width <= 1e-3)
-                    {
-                      // Dark blue interior: the minibrot silhouette is
-                      // visible instead of turning into a black hole.
-                      r += 24;
-                      g += 20;
-                      b += 48;
-                    }
+      for (i32 sy = 0; sy < s.ss; ++sy)
+        for (i32 sx = 0; sx < s.ss; ++sx)
+          {
+            if (s.work_generation != atomic_load (&s.generation))
+              return;
 
-                  continue;
-                }
+            const f64 dx = (x - s.w / 2.0 + (sx + 0.5) * sample) * scale;
+            const f64 dy = (s.h / 2.0 - y - (sy + 0.5) * sample) * scale;
 
-              const u32 color = mandelbrot_color (nu);
+            f64 nx, ny;
+            f64 nu = mandelbrot (dx, dy, &nx, &ny);
 
-              const f64 shade = mandelbrot_shade (nx, ny);
+            if (nu >= s.scene->iter_max)
+              {
+                if (color_inside && s.scene->width <= 1e-3)
+                  {
+                    r += 24;
+                    g += 20;
+                    b += 48;
+                  }
 
-              r += color_r (color) * shade;
-              g += color_g (color) * shade;
-              b += color_b (color) * shade;
-            }
+                continue;
+              }
 
-        image_set2 (s.image, x, y, color_rgb (r / samples, g / samples, b / samples));
-      }
+            const u32 color = mandelbrot_color (nu);
+
+            const f64 shade = mandelbrot_shade (nx, ny);
+
+            r += color_r (color) * shade;
+            g += color_g (color) * shade;
+            b += color_b (color) * shade;
+          }
+
+      image_set2 (s.image, x, y, color_rgb (r / samples, g / samples, b / samples));
+    }
 
   atomic_fetch_add (&s.tiles_done, 1);
 }
+
 
 
 // UI
@@ -1133,6 +1479,8 @@ help (FILE *f, const char *self)
   fprintf (f, "  --formula         <NAME>       Formula: mandelbrot or omnibrot\n");
   fprintf (f, "  --a               <float>      Set omnibrot's 'a' parameter (default 0.005)\n");
   fprintf (f, "  --palette         <PALETTE>    Set the palette's path\n");
+  fprintf (f, "  --no-gpu                       Disable GPU acceleration\n");
+  fprintf (f, "  --gpu-info                     Print GPU info and exit\n");
   fprintf (f, "\n");
   fprintf (f, "SCENE:\n");
   fprintf (f, "  A '*.sce' file\n");
@@ -1164,6 +1512,9 @@ main (i32 argc, char **argv)
 {
   i32 initial_w = 800;
   i32 initial_h = 600;
+
+  bool no_gpu = false;
+  bool gpu_info = false;
 
   const char *scene_path = NULL;
 
@@ -1420,6 +1771,20 @@ main (i32 argc, char **argv)
           continue;
         }
 
+      if (strcmp (arg, "--no-gpu") == 0)
+        {
+          no_gpu = true;
+          ++i;
+          continue;
+        }
+
+      if (strcmp (arg, "--gpu-info") == 0)
+        {
+          gpu_info = true;
+          ++i;
+          continue;
+        }
+
       if (scene_path)
         {
           fprintf (stderr, "Error: Scene path already specified (%s)\n", scene_path);
@@ -1427,6 +1792,21 @@ main (i32 argc, char **argv)
         }
 
       scene_path = argv[i++];
+    }
+
+  if (gpu_info)
+    {
+      if (!no_gpu)
+        gpu_init ();
+
+      printf ("GPU available: %s\n", gpu_is_available () ? "yes" : "no");
+
+      if (gpu_is_available ())
+        printf ("Device: %s\n", gpu_device_name ());
+
+      gpu_shutdown ();
+
+      return 0;
     }
 
   if (scene_path == NULL)
@@ -1562,11 +1942,26 @@ main (i32 argc, char **argv)
 
   s.running = true;
 
+  signal (SIGPIPE, SIG_IGN);
+
+  if (!no_gpu)
+    gpu_init ();
+
   s.phase = PHASE_IDLE;
 
   s.pool = thread_pool_create (SDL_GetCPUCount (), 1920 * 1080);
 
+  orbit_cache.valid = false;
+  mpfr_inits2 (FLOAT_PREC, orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
+
+  s.sectors = SDL_GetCPUCount ();
+
+  if (s.sectors < 1)
+    s.sectors = 4;
+
   s.image = image_create (s.w, s.h);
+
+  keyframe_image = image_create (s.w, s.h);
 
   s.orbit_re = calloc (s.scene->iter_max + 1, sizeof (f64));
   s.orbit_im = calloc (s.scene->iter_max + 1, sizeof (f64));
@@ -1632,6 +2027,18 @@ main (i32 argc, char **argv)
               case SDLK_v:
                 vibe = !vibe;
                 printf ("Vibe zoom: %s\n", vibe ? "on" : "off");
+
+                if (vibe)
+                  {
+                    // Disable SSAA in vibe mode for speed.
+                    s.ss_prev = s.ss;
+                    s.ss = 1;
+                  }
+                else if (s.ss_prev > 0)
+                  {
+                    s.ss = s.ss_prev;
+                  }
+
                 s.redraw = true;
                 break;
 
@@ -1654,6 +2061,8 @@ main (i32 argc, char **argv)
               case SDLK_m:
                 terminate ();
 
+                orbit_cache.valid = false;
+
                 s.formula = FORMULA_MANDELBROT;
 
                 s.redraw = true;
@@ -1661,6 +2070,8 @@ main (i32 argc, char **argv)
 
               case SDLK_o:
                 terminate ();
+
+                orbit_cache.valid = false;
 
                 s.formula = FORMULA_OMNIBROT;
 
@@ -1813,6 +2224,43 @@ main (i32 argc, char **argv)
                 }
                 break;
 
+              case SDLK_r:
+                if (rendering_video)
+                  break;
+
+                if (!recording)
+                  {
+                    free (recorded_views);
+                    recorded_views = NULL;
+                    recorded_count = 0;
+                    recorded_cap = 0;
+
+                    recording = true;
+
+                    // Vibe zoom gives a smooth trajectory while recording.
+                    vibe = true;
+
+                    printf ("Recording started\n");
+                  }
+                else
+                  {
+                    recording = false;
+
+                    vibe = false;
+
+                    if (recorded_count == 0)
+                      {
+                        printf ("No frames recorded\n");
+                      }
+                    else
+                      {
+                        start_render_phase ();
+                      }
+                  }
+
+                s.redraw = true;
+                break;
+
               case SDLK_1:
                 terminate ();
 
@@ -1877,6 +2325,8 @@ main (i32 argc, char **argv)
             break;
 
           case SDL_WINDOWEVENT:
+            if (rendering_video)
+              break;
             if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
               {
                 terminate ();
@@ -1930,6 +2380,14 @@ main (i32 argc, char **argv)
 
                 s.image = image_create (s.w, s.h);
 
+                if (keyframe_image)
+                  {
+                    image_destroy (keyframe_image);
+                    keyframe_image = image_create (s.w, s.h);
+                  }
+
+                has_keyframe = false;
+
                 free (works);
 
                 works = calloc (n_tiles (), sizeof (struct work));
@@ -1975,9 +2433,15 @@ main (i32 argc, char **argv)
             break;
           }
 
+      if (rendering_video)
+        vibe = false;
+
+      s.vibe = vibe;
+
       if (vibe)
         {
           static u64 vibe_counter = 0;
+
           vibe_counter++;
 
           i32 mx, my;
@@ -1991,12 +2455,154 @@ main (i32 argc, char **argv)
           s.pan_x = world_x - (sx / s.scale);
           s.pan_y = world_y - (sy / s.scale);
 
-          // The texture is scaled every frame; every 15th step starts a fresh
-          // render at the current zoom.
-          if (vibe_counter % 15 == 0)
+          // Refresh the underlying render periodically, but never interrupt an
+          // in-flight orbit computation: doing so stalls the whole frame and
+          // freezes the zoom.  While computing the orbit, just keep zooming.
+          if (vibe_counter % 4 == 0 && s.phase != PHASE_COMPUTE_ORBIT)
             {
               terminate ();
               s.redraw = true;
+            }
+        }
+
+      // Capture effective view while recording.
+      if (recording && !rendering_video)
+        {
+          struct view_state vs;
+
+          vs.c_re = s.center_re + s.pan_x * s.scene->width / (f64)s.w;
+          vs.c_im = s.center_im - s.pan_y * s.scene->width / (f64)s.w;
+          vs.width = s.scene->width / (s.scale == 0.0 ? 1.0 : s.scale);
+
+          vs.iter_max = s.scene->iter_max;
+          vs.iter_per_color = s.scene->iter_per_color;
+          vs.ss = s.ss;
+          vs.formula = s.formula;
+          vs.omni_a = s.omni_a;
+          vs.bailout = s.scene->bailout;
+          vs.lx = s.scene->lx;
+          vs.ly = s.scene->ly;
+          vs.lz = s.scene->lz;
+          vs.color_inside = color_inside;
+
+          bool dup = false;
+
+          if (recorded_count > 0)
+            {
+              struct view_state *last = &recorded_views[recorded_count - 1];
+
+              if (last->iter_max == vs.iter_max
+                  && last->ss == vs.ss
+                  && last->formula == vs.formula
+                  && fabs (last->c_re - vs.c_re)
+                       <= 1e-12 * (fabs (vs.c_re) + 1.0)
+                  && fabs (last->c_im - vs.c_im)
+                       <= 1e-12 * (fabs (vs.c_im) + 1.0)
+                  && fabs (last->width - vs.width)
+                       <= 1e-12 * (vs.width + 1.0))
+                dup = true;
+            }
+
+          if (!dup)
+            {
+              if (recorded_count == recorded_cap)
+                {
+                  usize new_cap = recorded_cap ? recorded_cap * 2 : 256;
+
+                  if (new_cap > 4096)
+                    new_cap = 4096;
+
+                  if (recorded_count < new_cap)
+                    {
+                      struct view_state *nv =
+                        realloc (recorded_views, new_cap * sizeof (struct view_state));
+
+                      if (nv)
+                        {
+                          recorded_views = nv;
+                          recorded_cap = new_cap;
+                        }
+                    }
+                }
+
+              if (recorded_count < recorded_cap)
+                {
+                  recorded_views[recorded_count++] = vs;
+                }
+              else
+                {
+                  recording = false;
+                  vibe = false;
+                  s.vibe = false;
+
+                  start_render_phase ();
+                }
+            }
+        }
+
+      // Schedule the next frame of the video render.
+      if (rendering_video && !video_frame_pending
+          && render_index < recorded_count
+          && s.phase == PHASE_IDLE)
+        {
+          struct view_state *v = &recorded_views[render_index];
+
+          if (has_keyframe && can_reuse_keyframe (&keyframe_view, v))
+            {
+              warp_keyframe (&keyframe_view, v);
+              video_frame_pending = true;
+              keyframe_pending = false;
+            }
+          else
+            {
+              terminate ();
+
+              s.formula = v->formula;
+              s.omni_a = v->omni_a;
+
+              // Adaptive fit of iter_max for this frame.
+              {
+                const u64 fitted_n = fit_video_n (v);
+                if (fitted_n != v->iter_max)
+                  {
+                    printf ("frame %zu/%zu: iter_max %lu -> %lu\n",
+                            render_index, recorded_count,
+                            (unsigned long)v->iter_max, (unsigned long)fitted_n);
+                    v->iter_max = fitted_n;
+                  }
+              }
+
+              if (v->iter_max != s.scene->iter_max)
+                apply_iter_max (v->iter_max);
+
+              s.scene->iter_per_color = v->iter_per_color;
+              s.scene->bailout = v->bailout;
+              s.scene->width = v->width;
+
+              mpfr_set_d (s.scene->c_re, v->c_re, MPFR_RNDN);
+              mpfr_set_d (s.scene->c_im, v->c_im, MPFR_RNDN);
+
+              s.scene->lx = v->lx;
+              s.scene->ly = v->ly;
+              s.scene->lz = v->lz;
+
+              s.ss = 2;
+
+              color_inside = v->color_inside;
+
+              s.pan_x = 0.0;
+              s.pan_y = 0.0;
+              s.scale = 1.0;
+
+              s.center_re = v->c_re;
+              s.center_im = v->c_im;
+
+              auto_iter = false;
+              auto_state = AUTO_OFF;
+
+              s.redraw = true;
+              video_frame_pending = true;
+              keyframe_pending = true;
             }
         }
 
@@ -2032,7 +2638,22 @@ main (i32 argc, char **argv)
               s.pan_y = 0.0L;
               s.scale = 1.0L;
 
+              {
+                i32 mx, my;
+                SDL_GetMouseState (&mx, &my);
+
+                if (mx < 0) mx = 0;
+                if (mx >= s.w) mx = s.w - 1;
+                if (my < 0) my = 0;
+                if (my >= s.h) my = s.h - 1;
+
+                s.mouse_cx = mx;
+                s.mouse_cy = my;
+              }
+
               image_fill (s.image, color_argb (0, 0, 0, 0));
+
+              atomic_store (&s.tiles_done, 0);
 
               s.work_generation = atomic_load (&s.generation);
 
@@ -2054,7 +2675,47 @@ main (i32 argc, char **argv)
 
               s.phase = PHASE_COMPUTE_ORBIT;
 
-              thread_pool_enqueue (s.pool, compute_orbit, NULL);
+                  bool cache_hit = false;
+
+              if (s.formula == FORMULA_MANDELBROT
+                  && orbit_cache.valid
+                  && orbit_cache.iter_max == s.scene->iter_max)
+                {
+                  const f64 cur_re = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
+                  const f64 cur_im = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
+
+                  const f64 dc_re = cur_re - orbit_cache.c_re_d;
+                  const f64 dc_im = cur_im - orbit_cache.c_im_d;
+                  const f64 width = s.scene->width;
+
+                  if (dc_re == 0.0 && dc_im == 0.0
+                      && mpfr_equal_p (orbit_cache.c_re, s.scene->c_re)
+                      && mpfr_equal_p (orbit_cache.c_im, s.scene->c_im))
+                    {
+                      delta_c_re = 0.0;
+                      delta_c_im = 0.0;
+                      cache_hit = true;
+                    }
+                  else if (width > ORBIT_REUSE_MIN_WIDTH
+                           && fabs (dc_re) / width < ORBIT_REUSE_EPS
+                           && fabs (dc_im) / width < ORBIT_REUSE_EPS)
+                    {
+                      delta_c_re = dc_re;
+                      delta_c_im = dc_im;
+                      cache_hit = true;
+                    }
+                }
+
+              if (cache_hit)
+                {
+                  atomic_store (&s.orbit_ready, true);
+                }
+              else
+                {
+                  delta_c_re = 0.0;
+                  delta_c_im = 0.0;
+                  thread_pool_enqueue (s.pool, compute_orbit, NULL);
+                }
             }
           break;
 
@@ -2067,57 +2728,116 @@ main (i32 argc, char **argv)
 
               s.phase = PHASE_COMPUTE_IMAGE;
 
-              const i32 cols = (s.w + TILE_SIZE - 1) / TILE_SIZE;
-              const i32 rows = (s.h + TILE_SIZE - 1) / TILE_SIZE;
-              const i32 tiles_total = cols * rows;
+              // Build a list of every pixel, sorted by distance from the mouse,
+              // so rendering fills the image in expanding rings (circles) around
+              // the cursor with no square-tile artefacts.
+              render_pixel_count = (usize)s.w * (usize)s.h;
 
-              i32 mx, my;
-              SDL_GetMouseState (&mx, &my);
-
-              i32 tile_x = mx / TILE_SIZE;
-              i32 tile_y = my / TILE_SIZE;
-
-              if (tile_x < 0) tile_x = 0;
-              if (tile_x >= cols) tile_x = cols - 1;
-              if (tile_y < 0) tile_y = 0;
-              if (tile_y >= rows) tile_y = rows - 1;
-
-              i32 step_size = 1;
-              i32 direction = 0;
-              i32 tiles_enqueued = 0;
-
-              usize n = 0;
-
-              const i32 dx[] = { 1,  0, -1,  0 };
-              const i32 dy[] = { 0,  1,  0, -1 };
-
-              while (tiles_enqueued < tiles_total)
+              if (render_pixel_count > render_pixels_cap)
                 {
-                  for (i32 i = 0; i < 2; i++)
+                  free (render_pixels);
+                  render_pixels = malloc (render_pixel_count * sizeof (struct point));
+                  render_pixels_cap = render_pixels ? render_pixel_count : 0;
+                }
+
+              if (render_pixels)
+                {
+                  i32 maxr2 = 0;
+                  const i32 dxs[2] = { s.mouse_cx, s.w - 1 - s.mouse_cx };
+                  const i32 dys[2] = { s.mouse_cy, s.h - 1 - s.mouse_cy };
+
+                  for (i32 i = 0; i < 2; ++i)
+                    for (i32 j = 0; j < 2; ++j)
+                      {
+                        const i32 r2 = dxs[i] * dxs[i] + dys[j] * dys[j];
+                        if (r2 > maxr2) maxr2 = r2;
+                      }
+
+                  if ((usize)maxr2 + 1 > render_counts_cap)
                     {
-                      for (i32 j = 0; j < step_size; j++)
-                        {
-                          if (tile_x >= 0 && tile_x < cols && tile_y >= 0 && tile_y < rows)
-                            {
-                              struct work *work = &works[n];
-
-                              work->x = tile_x * TILE_SIZE;
-                              work->y = tile_y * TILE_SIZE;
-
-                              thread_pool_enqueue(s.pool, worker, work);
-
-                              n++;
-                              tiles_enqueued++;
-                            }
-
-                          tile_x += dx[direction];
-                          tile_y += dy[direction];
-                        }
-
-                      direction = (direction + 1) % 4;
+                      free (render_counts);
+                      render_counts = calloc ((usize)maxr2 + 1, sizeof (usize));
+                      render_counts_cap = render_counts ? (usize)maxr2 + 1 : 0;
                     }
 
-                  step_size++;
+                  if (render_counts)
+                    {
+                      memset (render_counts, 0, ((usize)maxr2 + 1) * sizeof (usize));
+
+                      for (i32 y = 0; y < s.h; ++y)
+                        for (i32 x = 0; x < s.w; ++x)
+                          {
+                            const i32 dx = x - s.mouse_cx;
+                            const i32 dy = y - s.mouse_cy;
+                            const i32 r2 = dx * dx + dy * dy;
+                            render_counts[r2]++;
+                          }
+
+                      usize sum = 0;
+                      for (i32 r = 0; r <= maxr2; ++r)
+                        {
+                          const usize c = render_counts[r];
+                          render_counts[r] = sum;
+                          sum += c;
+                        }
+
+                      for (i32 y = 0; y < s.h; ++y)
+                        for (i32 x = 0; x < s.w; ++x)
+                          {
+                            const i32 dx = x - s.mouse_cx;
+                            const i32 dy = y - s.mouse_cy;
+                            const i32 r2 = dx * dx + dy * dy;
+
+                            render_pixels[render_counts[r2]].x = x;
+                            render_pixels[render_counts[r2]].y = y;
+                            render_pixels[render_counts[r2]].r2 = (f64)r2;
+                            render_counts[r2]++;
+                          }
+                    }
+                }
+
+              if (gpu_is_available ()
+                  && gpu_should_use (s.w, s.h, s.ss, s.scene->iter_max,
+                                    s.scene->width, s.formula, vibe))
+                {
+                  struct gpu_view gv;
+                  gv.c_re = s.center_re;
+                  gv.c_im = s.center_im;
+                  gv.width = s.scene->width;
+                  gv.iter_max = s.scene->iter_max;
+                  gv.iter_per_color = s.scene->iter_per_color;
+                  gv.ss = s.ss;
+                  gv.formula = s.formula;
+                  gv.omni_a = s.omni_a;
+                  gv.bailout = s.scene->bailout;
+                  gv.lx = s.scene->lx;
+                  gv.ly = s.scene->ly;
+                  gv.lz = s.scene->lz;
+                  gv.color_inside = color_inside;
+                  gv.w = s.w;
+                  gv.h = s.h;
+                  gv.palette = s.palette;
+                  gv.orbit_re = s.orbit_re;
+                  gv.orbit_im = s.orbit_im;
+                  gv.delta_c_re = delta_c_re;
+                  gv.delta_c_im = delta_c_im;
+                  gv.period_tol = period_tol;
+
+                  gpu_render_mandelbrot (&gv, s.image);
+
+                  atomic_store (&s.tiles_done, n_tiles ());
+                }
+              else
+                {
+                  const i32 workers = n_tiles ();
+
+                  for (i32 wkr = 0; wkr < workers; ++wkr)
+                    {
+                      works[wkr].offset = wkr;
+                      works[wkr].stride = workers;
+
+                      thread_pool_enqueue (s.pool, worker, &works[wkr]);
+                    }
                 }
 
             }
@@ -2168,26 +2888,81 @@ main (i32 argc, char **argv)
           break;
         }
 
-      // Upload texture
-      {
-        i32 pitch;
-        void *pixels;
+      // Write a completed video frame.
+      if (rendering_video && video_frame_pending && s.phase == PHASE_IDLE)
+        {
+          if (ffmpeg_pipe)
+            {
+              for (i32 y = 0; y < s.image->h; ++y)
+                for (i32 x = 0; x < s.image->w; ++x)
+                  {
+                    const u32 c = image_get2 (s.image, x, y);
 
-        SDL_LockTexture (s.texture, NULL, &pixels, &pitch);
+                    const unsigned char rgb[3] = { color_r (c), color_g (c), color_b (c) };
 
-        for (i32 y = 0; y < s.image->h; ++y)
+                    fwrite (rgb, 1, 3, ffmpeg_pipe);
+                  }
+
+              fflush (ffmpeg_pipe);
+            }
+
+          if (keyframe_pending)
+            {
+              image_copy (s.image, keyframe_image);
+              keyframe_view = recorded_views[render_index];
+              has_keyframe = true;
+              keyframe_pending = false;
+              keyframe_render_index = render_index;
+            }
+
+          video_frame_pending = false;
+          render_index++;
+
+          if (render_index >= recorded_count)
+            {
+              if (ffmpeg_pipe)
+                {
+                  pclose (ffmpeg_pipe);
+                  ffmpeg_pipe = NULL;
+                }
+
+              rendering_video = false;
+
+              printf ("Recording render finished: %zu frames -> '%s'\n",
+                      recorded_count, video_path);
+            }
+        }
+
+      // In vibe mode, do not push partially-rendered frames to the canvas:
+      // scaling an incomplete image causes flicker.  Keep the last complete
+      // render until the new one is finished.
+      const bool vibe_upload_ok = !vibe
+        || (s.phase == PHASE_IDLE
+            && atomic_load (&s.tiles_done) == n_tiles ());
+
+      if (vibe_upload_ok)
+        {
+          // Upload texture
           {
-            u32 *row = (u32 *)((u8 *)pixels + (usize)y * (usize)pitch);
+            i32 pitch;
+            void *pixels;
 
-            for (i32 x = 0; x < s.image->w; ++x)
-              row[x] = image_get2 (s.image, x, y);
+            SDL_LockTexture (s.texture, NULL, &pixels, &pitch);
+
+            for (i32 y = 0; y < s.image->h; ++y)
+              {
+                u32 *row = (u32 *)((u8 *)pixels + (usize)y * (usize)pitch);
+
+                for (i32 x = 0; x < s.image->w; ++x)
+                  row[x] = image_get2 (s.image, x, y);
+              }
+
+            SDL_UnlockTexture (s.texture);
           }
 
-        SDL_UnlockTexture (s.texture);
-      }
-
-      SDL_SetRenderTarget (s.renderer, s.texture_canvas);
-      SDL_RenderCopy (s.renderer, s.texture, NULL, NULL);
+          SDL_SetRenderTarget (s.renderer, s.texture_canvas);
+          SDL_RenderCopy (s.renderer, s.texture, NULL, NULL);
+        }
 
       SDL_SetRenderTarget (s.renderer, NULL);
       SDL_RenderClear (s.renderer);
@@ -2317,6 +3092,7 @@ main (i32 argc, char **argv)
           write_ct (y++, "Omnibrot formula ; o");
           write_ct (y++, "Omnibrot a -/+ ; [ / ]");
           write_ct (y++, "Save scene ; s");
+          write_ct (y++, "Record video (R toggle) ; r");
           write_ct (y++, "Terminate ; Escape");
           write_ct (y++, "Pan ; Left Click + Drag");
           write_ct (y++, "Zoom toward mouse ; Scroll Wheel");
@@ -2326,12 +3102,35 @@ main (i32 argc, char **argv)
 #undef write_ct
         }
 
+      if (recording)
+        write_text (s.w - 80, 10, 255, 64, 64, "REC");
+
+      if (rendering_video)
+        write_text (10, 10, 196, 196, 196, "Rendering video: %zu/%zu",
+                    render_index, recorded_count);
+
       SDL_RenderPresent (s.renderer);
     }
 
+  if (ffmpeg_pipe)
+    {
+      pclose (ffmpeg_pipe);
+      ffmpeg_pipe = NULL;
+    }
+
+  free (recorded_views);
+
   terminate ();
 
+  mpfr_clears (orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
+
+  if (keyframe_image)
+    image_destroy (keyframe_image);
+
   image_destroy (s.image);
+
+  free (render_pixels);
+  free (render_counts);
 
   SDL_DestroyTexture (s.texture);
   SDL_DestroyRenderer (s.renderer);
@@ -2339,6 +3138,8 @@ main (i32 argc, char **argv)
 
   palette_destroy (s.palette);
   scene_destroy (s.scene);
+
+  gpu_shutdown ();
 
   TTF_Quit ();
   SDL_Quit ();

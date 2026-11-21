@@ -78,6 +78,12 @@ typedef double f64;
 // #define F80_RAD2DEG 180.0L / F80_PI
 
 
+enum formula
+{
+  FORMULA_MANDELBROT,
+  FORMULA_OMNIBROT,
+};
+
 void *
 malloc0 (usize size);
 
