@@ -29,6 +29,17 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
 - `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
 
+## BLA acceleration
+- `src/bla.c`/`bla.h`: second-order bilinear approximation of the reference
+  orbit, with double mantissa + explicit binary exponent for coefficients.
+  Coefficients overflow plain `double` at depth (~10^700).
+- Enabled automatically for `width <= 1e-12`; disable with `MANDEX_BLA=0`,
+  tune the log2 safety margin with `MANDEX_BLA_MARGIN` (default 16).
+- Uses the CPU renderer: `gpu_init()` is skipped while BLA is enabled because
+  PoCL cannot compile the extended-exponent kernel on this host.
+- Debug hooks: `MANDEX_AUTO_FRAMES`, `MANDEX_DUMP`, `MANDEX_DUMP_LIMIT`,
+  `MANDEX_DIFF_REUSE`, `MANDEX_NO_AUTO`.
+
 ## Notes
 - `terminate()` called before state changes requiring recompute.
 - `apply_iter_max()` reallocates orbit buffers.

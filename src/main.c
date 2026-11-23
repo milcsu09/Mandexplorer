@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include <time.h>
 
+#include "bla.h"
 #include "color.h"
 #include "common.h"
 #include "config.h"
@@ -41,8 +42,11 @@
 #define VIDEO_FIT_PROBE_MIN_SAMP  128
 #define VIDEO_FIT_SENS_LO         0.005
 
-#define KEYFRAME_MAX_REUSE     5
 #define KEYFRAME_MAX_MAG       1.5
+
+// Number of video frames served by one full keyframe render.  Overridable
+// for A/B measurement through MANDEX_DIFF_REUSE.
+static i32 keyframe_max_reuse = 5;
 
 // Adaptive iteration control.
 //
@@ -219,6 +223,11 @@ struct orbit_cache
 };
 
 static struct orbit_cache orbit_cache;
+static struct bla_table bla_table;
+
+// log2 safety margin between |dz| and a BLA step's validity radius.
+static f64 bla_margin = 16.0;
+static bool bla_enabled = true;
 static f64 delta_c_re = 0.0;
 static f64 delta_c_im = 0.0;
 
@@ -267,6 +276,12 @@ static usize render_index = 0;
 
 static FILE *ffmpeg_pipe = NULL;
 static char video_path[256] = { 0 };
+
+// Optional frame dumps for A/B comparison of keyframe reuse settings.
+static const char *dump_prefix = NULL;
+static usize dump_limit = 0;
+static usize dump_count = 0;
+static usize auto_frames = 0;
 
 
 void
@@ -325,7 +340,8 @@ start_render_phase (void)
   snprintf (cmd, sizeof cmd,
             "ffmpeg -y -hide_banner -loglevel error "
             "-f rawvideo -pix_fmt rgb24 -s %dx%d -r 30 -i - "
-            "-c:v libx264 -pix_fmt yuv444p -preset fast "
+            "-c:v libx264 -pix_fmt yuv444p -preset fast -g 60 "
+            "-movflags +frag_keyframe+empty_moov "
             "\"%s\"",
             s.w, s.h, video_path);
 
@@ -347,6 +363,11 @@ start_render_phase (void)
 static u64
 fit_video_n (struct view_state *v)
 {
+  // Do not shrink iter_max for video frames: the adaptive probe can
+  // underestimate the required depth and produce half-black deep zooms.
+  // Keep the (possibly adapted) iter_max captured for this frame.
+  return v->iter_max;
+
   const u64 recorded = v->iter_max;
 
   u64 min_n = recorded / VIDEO_FIT_MIN_SHRINK;
@@ -434,7 +455,7 @@ can_reuse_keyframe (const struct view_state *kv, const struct view_state *v)
 
   if (S < 1.0 / KEYFRAME_MAX_MAG) return false;
 
-  if (render_index - keyframe_render_index >= KEYFRAME_MAX_REUSE) return false;
+  if (render_index - keyframe_render_index >= (usize) keyframe_max_reuse) return false;
 
   return true;
 }
@@ -505,6 +526,35 @@ warp_keyframe (const struct view_state *kv, const struct view_state *v)
           image_set2 (s.image, x, y, c);
         }
     }
+}
+
+
+static void
+dump_ppm (void)
+{
+  if (!dump_prefix || dump_count >= dump_limit)
+    return;
+
+  char path[512];
+
+  snprintf (path, sizeof path, "%s%04zu.ppm", dump_prefix, dump_count++);
+
+  FILE *f = fopen (path, "wb");
+
+  if (!f)
+    return;
+
+  fprintf (f, "P6\n%d %d\n255\n", s.w, s.h);
+
+  for (i32 y = 0; y < s.h; ++y)
+    for (i32 x = 0; x < s.w; ++x)
+      {
+        const u32 c = image_get2 (s.image, x, y);
+        const unsigned char rgb[3] = { color_r (c), color_g (c), color_b (c) };
+        fwrite (rgb, 1, 3, f);
+      }
+
+  fclose (f);
 }
 
 
@@ -579,6 +629,7 @@ apply_iter_max (u64 iter_max)
     return false;
 
   orbit_cache.valid = false;
+  bla_table.valid = false;
 
   f64 *orbit_re = calloc (iter_max + 1, sizeof (f64));
   f64 *orbit_im = calloc (iter_max + 1, sizeof (f64));
@@ -663,6 +714,17 @@ compute_orbit (void *argument)
   orbit_cache.c_im_d = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
   orbit_cache.iter_max = s.scene->iter_max;
   orbit_cache.valid = true;
+
+  // At shallow depths the skipped fraction is too small to pay for the
+  // extended-exponent polynomial, so only engage BLA for real deep zooms.
+  if (bla_enabled && s.scene->width <= 1e-12)
+    {
+      const f64 shift = hypot (delta_c_re, delta_c_im);
+      bla_build (&bla_table, s.orbit_re, s.orbit_im, s.scene->iter_max,
+                 s.scene->width * 0.75 + shift, bla_margin);
+    }
+  else
+    bla_clear (&bla_table);
 
   atomic_store (&s.orbit_ready, true);
 }
@@ -1257,6 +1319,45 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
       if (s.work_generation != atomic_load (&s.generation))
         return 0.0;
 
+      u64 span = 0;
+
+      if (bla_table.valid
+          && iter_orbit % BLA_BASE_STEP == 0
+          && iter_orbit + BLA_BASE_STEP <= s.scene->iter_max
+          && iter + BLA_BASE_STEP <= s.scene->iter_max
+          && bla_try_skip (&bla_table, iter_orbit,
+                           &epsilon_re, &epsilon_im, &deriv_re, &deriv_im,
+                           delta_re, delta_im, &span))
+        {
+          iter += span;
+          iter_orbit += span;
+
+          const f64 zr = s.orbit_re[iter_orbit] + epsilon_re;
+          const f64 zi = s.orbit_im[iter_orbit] + epsilon_im;
+          const f64 z2 = zr * zr + zi * zi;
+
+          if (z2 > bailout2)
+            {
+              const f64 a = zr * deriv_re + zi * deriv_im;
+              const f64 bb = zi * deriv_re - zr * deriv_im;
+              const f64 len = hypot (a, bb);
+
+              if (nx) *nx = len > 0.0 ? a / len : 0.0;
+              if (ny) *ny = len > 0.0 ? bb / len : 0.0;
+
+              return fmax (0.0, iter + 1 - log (log (z2) * 0.5) / F64_LN2);
+            }
+
+          if (epsilon_re * epsilon_re + epsilon_im * epsilon_im > z2 / 2.0)
+            {
+              epsilon_re = zr;
+              epsilon_im = zi;
+              iter_orbit = 0;
+            }
+
+          continue;
+        }
+
       f64 r_re;
       f64 r_im;
 
@@ -1590,6 +1691,47 @@ main (i32 argc, char **argv)
 
   const char *c_re = NULL;
   const char *c_im = NULL;
+
+  const char *reuse_env = getenv ("MANDEX_DIFF_REUSE");
+
+  if (reuse_env)
+    {
+      const long v = strtol (reuse_env, NULL, 10);
+      if (v > 0)
+        keyframe_max_reuse = (i32) v;
+    }
+
+  const char *bla_env = getenv ("MANDEX_BLA");
+
+  if (bla_env && strcmp (bla_env, "0") == 0)
+    bla_enabled = false;
+
+  bla_env = getenv ("MANDEX_BLA_MARGIN");
+
+  if (bla_env)
+    {
+      const f64 v = strtod (bla_env, NULL);
+      if (isfinite (v) && v >= 0.0 && v <= 64.0)
+        bla_margin = v;
+    }
+
+  const char *frames_env = getenv ("MANDEX_AUTO_FRAMES");
+
+  if (frames_env)
+    {
+      const long v = strtol (frames_env, NULL, 10);
+      if (v > 0)
+        auto_frames = (usize) v;
+    }
+
+  dump_prefix = getenv ("MANDEX_DUMP");
+
+  if (dump_prefix)
+    {
+      const char *limit_env = getenv ("MANDEX_DUMP_LIMIT");
+      const long v = limit_env ? strtol (limit_env, NULL, 10) : 8;
+      dump_limit = v > 0 ? (usize) v : 8;
+    }
 
   struct opt_f64 width = { 0 };
 
@@ -2014,7 +2156,7 @@ main (i32 argc, char **argv)
 
   signal (SIGPIPE, SIG_IGN);
 
-  if (!no_gpu)
+  if (!no_gpu && !bla_enabled)
     gpu_init ();
 
   s.phase = PHASE_IDLE;
@@ -2057,6 +2199,48 @@ main (i32 argc, char **argv)
   auto_state = AUTO_HOLD;
   auto_render_ms = 0;
   auto_sensitivity = 0.0;
+
+  if (getenv ("MANDEX_NO_AUTO"))
+    auto_iter = false;
+
+  if (auto_frames > 0)
+    {
+      recorded_cap = auto_frames;
+      recorded_views = calloc (recorded_cap, sizeof (struct view_state));
+
+      if (recorded_views)
+        {
+          const f64 c_re = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
+          const f64 c_im = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
+          f64 width = s.scene->width;
+
+          for (usize i = 0; i < auto_frames; ++i)
+            {
+              struct view_state vs = { 0 };
+
+              vs.c_re = c_re;
+              vs.c_im = c_im;
+              vs.width = width;
+              vs.iter_max = s.scene->iter_max;
+              vs.recorded_iter_max = s.scene->iter_max;
+              vs.iter_per_color = s.scene->iter_per_color;
+              vs.ss = s.ss;
+              vs.formula = s.formula;
+              vs.omni_a = s.omni_a;
+              vs.bailout = s.scene->bailout;
+              vs.lx = s.scene->lx;
+              vs.ly = s.scene->ly;
+              vs.lz = s.scene->lz;
+              vs.color_inside = color_inside;
+
+              recorded_views[recorded_count++] = vs;
+
+              width /= 1.02;
+            }
+
+          start_render_phase ();
+        }
+    }
 
   struct work *works = calloc (n_tiles (), sizeof (struct work));
 
@@ -3008,13 +3192,17 @@ main (i32 argc, char **argv)
 
               const bool can_probe = auto_iter
                                      && !vibe
+                                     && !rendering_video
                                      && probe_width > AUTO_DEEP_WIDTH
                                      && isfinite (probe_width);
 
               if (!can_probe)
                 {
-                  auto_iter_update (compute_image_total, vibe);
-                  persist_video_iter ();
+                  if (!rendering_video)
+                    {
+                      auto_iter_update (compute_image_total, vibe);
+                      persist_video_iter ();
+                    }
                   s.phase = PHASE_IDLE;
 
                   if (vibe)
@@ -3032,8 +3220,11 @@ main (i32 argc, char **argv)
                 s.phase = PHASE_PROBE;
               else
                 {
-                  auto_iter_update (compute_image_total, vibe);
-                  persist_video_iter ();
+                  if (!rendering_video)
+                    {
+                      auto_iter_update (compute_image_total, vibe);
+                      persist_video_iter ();
+                    }
                   s.phase = PHASE_IDLE;
                 }
             }
@@ -3042,8 +3233,11 @@ main (i32 argc, char **argv)
         case PHASE_PROBE:
           if (atomic_load (&probe_done))
             {
-              auto_iter_update (compute_image_total, vibe);
-              persist_video_iter ();
+              if (!rendering_video)
+                {
+                  auto_iter_update (compute_image_total, vibe);
+                  persist_video_iter ();
+                }
 
               s.phase = PHASE_IDLE;
             }
@@ -3080,6 +3274,8 @@ main (i32 argc, char **argv)
               keyframe_render_index = render_index;
             }
 
+          dump_ppm ();
+
           video_frame_pending = false;
           render_index++;
 
@@ -3095,6 +3291,9 @@ main (i32 argc, char **argv)
 
               printf ("Recording render finished: %zu frames -> '%s'\n",
                       recorded_count, video_path);
+
+              if (auto_frames > 0)
+                s.running = false;
             }
         }
 
@@ -3300,6 +3499,8 @@ main (i32 argc, char **argv)
 
   free (render_pixels);
   free (render_counts);
+
+  bla_clear (&bla_table);
 
   SDL_DestroyTexture (s.texture);
   SDL_DestroyRenderer (s.renderer);
