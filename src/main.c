@@ -2757,6 +2757,13 @@ main (i32 argc, char **argv)
           vs.lz = s.scene->lz;
           vs.color_inside = color_inside;
 
+          // A view is a duplicate only when it moved by less than a
+          // thousandth of a pixel.  The old fixed 1e-12 tolerance was
+          // absolute: once the zoom was deeper than ~5e-11 it exceeded a
+          // whole 2% zoom step, so every frame was silently dropped and
+          // recording froze at ~1300 frames.
+          const f64 view_tol = vs.width / (f64) s.w * 1e-3;
+
           bool dup = false;
 
           if (recorded_count > 0)
@@ -2766,12 +2773,9 @@ main (i32 argc, char **argv)
               if (last->iter_max == vs.iter_max
                   && last->ss == vs.ss
                   && last->formula == vs.formula
-                  && fabs (last->c_re - vs.c_re)
-                       <= 1e-12 * (fabs (vs.c_re) + 1.0)
-                  && fabs (last->c_im - vs.c_im)
-                       <= 1e-12 * (fabs (vs.c_im) + 1.0)
-                  && fabs (last->width - vs.width)
-                       <= 1e-12 * (vs.width + 1.0))
+                  && fabs (last->c_re - vs.c_re) <= view_tol
+                  && fabs (last->c_im - vs.c_im) <= view_tol
+                  && fabs (last->width - vs.width) <= view_tol)
                 dup = true;
             }
 
@@ -2781,8 +2785,8 @@ main (i32 argc, char **argv)
                 {
                   usize new_cap = recorded_cap ? recorded_cap * 2 : 256;
 
-                  if (new_cap > 4096)
-                    new_cap = 4096;
+                  if (new_cap > 65536)
+                    new_cap = 65536;
 
                   if (recorded_count < new_cap)
                     {
@@ -2803,6 +2807,8 @@ main (i32 argc, char **argv)
                 }
               else
                 {
+                  printf ("Recording buffer full at %zu frames; rendering now\n",
+                          recorded_count);
                   recording = false;
                   vibe = false;
 

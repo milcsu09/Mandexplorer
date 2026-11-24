@@ -40,8 +40,14 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Debug hooks: `MANDEX_AUTO_FRAMES`, `MANDEX_DUMP`, `MANDEX_DUMP_LIMIT`,
   `MANDEX_DIFF_REUSE`, `MANDEX_NO_AUTO`.
 
+## Recording
+- `r` starts/stops capturing views; the confirmation `r` triggers the mp4 render.
+- Duplicate detection compares against the previous view with a **sub-pixel**
+  tolerance (`width / W * 1e-3`). A fixed absolute tolerance used to freeze
+  recording at ~1300 frames once deep zoom made 2% steps smaller than it.
+- Capture buffer grows 256 -> 65536 views; a full buffer prints a message and
+  renders immediately rather than silently dropping frames.
+
 ## Notes
 - `terminate()` called before state changes requiring recompute.
 - `apply_iter_max()` reallocates orbit buffers.
-EOF
-path="/home/et/Applications/Mandexplorer/AGENTS.md"
