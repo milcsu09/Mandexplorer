@@ -231,6 +231,9 @@ static struct bla_table bla_table;
 // s.image stays full-size (UI, video, texture); preview_render_image is the
 // half-size render target.  Preview is never used for final output.
 static bool preview_mode = false;
+// Divisor for the preview render resolution: 1 = full (crisp), 2 = half
+// (FSRCNN x2 upscale), 3-4 = bilinear fallback only.
+static i32 preview_div = 2;
 static struct image *preview_render_image = NULL;
 static i32 render_w = 0;
 static i32 render_h = 0;
@@ -604,8 +607,8 @@ preview_update_dims (void)
 {
   if (preview_mode)
     {
-      render_w = s.w / 2;
-      render_h = s.h / 2;
+      render_w = s.w / preview_div;
+      render_h = s.h / preview_div;
 
       if (render_w < 1) render_w = 1;
       if (render_h < 1) render_h = 1;
@@ -785,7 +788,10 @@ preview_stop_thread (void)
 static void
 preview_submit_job (void)
 {
-  if (!preview_mode || !preview_thread_started || !preview_render_image)
+  // FSRCNN x2 only matches a half-resolution render.  At full resolution the
+  // image is already crisp; at other divisors only the live fallback is used.
+  if (!preview_mode || preview_div != 2
+      || !preview_thread_started || !preview_render_image)
     return;
 
   pthread_mutex_lock (&preview_mutex);
@@ -808,7 +814,7 @@ preview_submit_job (void)
 static struct image *
 preview_display_image (void)
 {
-  if (!preview_mode)
+  if (!preview_mode || preview_div == 1)
     return s.image;
 
   bool have_result = false;
@@ -1795,7 +1801,8 @@ worker (void *argument)
 
   const f64 scale = s.scene->width / (f64) render_w;
 
-  struct image *target = preview_mode ? preview_render_image : s.image;
+  struct image *target =
+    (preview_mode && preview_div > 1) ? preview_render_image : s.image;
 
   const usize offset = work->offset;
   const usize stride = work->stride;
@@ -1933,8 +1940,9 @@ help (FILE *f, const char *self)
   fprintf (f, "  --a               <float>      Set omnibrot's 'a' parameter (default 0.005)\n");
   fprintf (f, "  --palette         <PALETTE>    Set the palette's path\n");
   fprintf (f, "  --no-gpu                       Disable GPU acceleration\n");
-  fprintf (f, "  --preview                      Half-res render + FSRCNN x2 for display (preview only)\n");
+  fprintf (f, "  --preview                      Preview mode: reduced-res render, async upscale\n");
   fprintf (f, "  --fullscreen                   Use the desktop resolution as the window size\n");
+  fprintf (f, "  --preview-div  <int>          Preview render divisor: 1 full, 2 + FSRCNN (default 2)\n");
   fprintf (f, "  --gpu-info                     Print GPU info and exit\n");
   fprintf (f, "\n");
   fprintf (f, "SCENE:\n");
@@ -2287,6 +2295,24 @@ main (i32 argc, char **argv)
       if (strcmp (arg, "--fullscreen") == 0)
         {
           fullscreen = true;
+          ++i;
+          continue;
+        }
+
+      if (strcmp (arg, "--preview-div") == 0)
+        {
+          if (i + 1 >= argc)
+            {
+              fprintf (stderr, "Error: '--preview-div' requires an integer\n");
+              return 1;
+            }
+          const long v = strtol (argv[++i], NULL, 10);
+          if (v < 1 || v > 4)
+            {
+              fprintf (stderr, "Error: '--preview-div' must be 1..4\n");
+              return 1;
+            }
+          preview_div = (i32) v;
           ++i;
           continue;
         }
@@ -3356,8 +3382,8 @@ main (i32 argc, char **argv)
                   if (render_pixels)
                     {
                       i32 maxr2 = 0;
-                      const i32 mcx = preview_mode ? s.mouse_cx / 2 : s.mouse_cx;
-                      const i32 mcy = preview_mode ? s.mouse_cy / 2 : s.mouse_cy;
+                      const i32 mcx = preview_mode ? s.mouse_cx / preview_div : s.mouse_cx;
+                      const i32 mcy = preview_mode ? s.mouse_cy / preview_div : s.mouse_cy;
                       const i32 dxs[2] = { mcx, render_w - 1 - mcx };
                       const i32 dys[2] = { mcy, render_h - 1 - mcy };
 
