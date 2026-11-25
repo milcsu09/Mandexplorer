@@ -250,6 +250,7 @@ static bool preview_result_ready = false;
 static struct image *preview_job_src = NULL;  // half-res snapshot for worker
 static struct image *preview_job_dst = NULL;  // full-res result from worker
 static struct image *preview_fast_image = NULL;  // live bilinear fallback
+static u32 preview_fast_stamp = 0;
 
 // log2 safety margin between |dz| and a BLA step's validity radius.
 static f64 bla_margin = 16.0;
@@ -831,14 +832,22 @@ preview_display_image (void)
   if (have_result || !preview_fast_image || !preview_render_image)
     return s.image;
 
-  for (i32 y = 0; y < s.h; ++y)
-    for (i32 x = 0; x < s.w; ++x)
-      {
-        const f64 sx = ((f64) x + 0.5) * (f64) render_w / (f64) s.w - 0.5;
-        const f64 sy = ((f64) y + 0.5) * (f64) render_h / (f64) s.h - 0.5;
-        image_set2 (preview_fast_image, x, y,
-                    bilinear_sample (preview_render_image, sx, sy));
-      }
+  // Throttle: doing a full-screen bilinear pass on every display tick costs
+  // more CPU than the render itself at deep zoom.  4 Hz is enough for a live
+  // progress indicator.
+  const u32 now = SDL_GetTicks ();
+  if (now - preview_fast_stamp >= 250)
+    {
+      for (i32 y = 0; y < s.h; ++y)
+        for (i32 x = 0; x < s.w; ++x)
+          {
+            const f64 sx = ((f64) x + 0.5) * (f64) render_w / (f64) s.w - 0.5;
+            const f64 sy = ((f64) y + 0.5) * (f64) render_h / (f64) s.h - 0.5;
+            image_set2 (preview_fast_image, x, y,
+                        bilinear_sample (preview_render_image, sx, sy));
+          }
+      preview_fast_stamp = now;
+    }
 
   return preview_fast_image;
 }
@@ -2494,7 +2503,7 @@ main (i32 argc, char **argv)
 
   signal (SIGPIPE, SIG_IGN);
 
-  if (!no_gpu && !bla_enabled)
+  if (!no_gpu && !preview_mode)
     gpu_init ();
 
   s.phase = PHASE_IDLE;
@@ -3357,10 +3366,14 @@ main (i32 argc, char **argv)
               // In vibe mode render on the CPU so the expanding circle of
               // progress stays visible (GPU walks a 2D grid and commits the
               // whole frame at once).  Non-vibe renders may still use the GPU.
+              // BLA owns the deep-zoom path (the GPU kernel cannot compile
+              // its extended-exponent coefficients here); everywhere else the
+              // GPU is free to accelerate the render.
               const bool use_gpu =
                 !vibe
                 && gpu_is_available ()
                 && !preview_mode
+                && !(bla_enabled && s.scene->width <= 1e-12)
                 && gpu_should_use (s.w, s.h, s.render_ss, s.scene->iter_max,
                                    s.scene->width, s.formula, s.render_vibe);
 
