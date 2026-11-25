@@ -62,12 +62,16 @@ In-app preview uses the same model:
 
 ```bash
 make
-./a --preview -w 800 -h 600 my_scene.sce
+./a --preview --fullscreen my_scene.sce
+# or pick the size explicitly:
+./a --preview -w 1600 -h 900 my_scene.sce
 ```
 
 The window stays at the requested size; the fractal is computed at half
-resolution and upscaled with FSRCNN before display. The display thread blocks
-for about a second per completed frame, so this is for navigation only.
+resolution and upscaled with FSRCNN before display. Upscaling runs on its own
+thread, so navigation never freezes: a cheap bilinear preview of the half-res
+buffer is shown until the neural result arrives (~1 s at 800x600, ~3.5 s at
+1600x900). This is for navigation only.
 The model comes from `opencv_extra` (converted from the Apache-2.0 FSRCNN
 TensorFlow model) and is included as `models/FSRCNN_x2.onnx`.
 

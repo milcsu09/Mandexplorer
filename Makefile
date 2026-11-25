@@ -10,4 +10,4 @@ else
 endif
 
 all:
-	gcc -std=c11 -Wall -Wextra -Wpedantic -O3 $(EXTRA_CFLAGS) -oa $(wildcard src/*.c) -lm -lSDL2 -lSDL2_ttf -lmpfr $(EXTRA_LIBS)
+	gcc -std=c11 -Wall -Wextra -Wpedantic -O3 -pthread $(EXTRA_CFLAGS) -oa $(wildcard src/*.c) -lm -lSDL2 -lSDL2_ttf -lmpfr $(EXTRA_LIBS)

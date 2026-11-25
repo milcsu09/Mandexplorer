@@ -50,11 +50,15 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 
 ## Neural preview
 - `--preview`: fractal is computed into `preview_render_image` at half of
-  `s.w x s.h`, then `preview_upscale()` pipes it through
+  `s.w x s.h`, then a dedicated worker thread pipes it through
   `tools/nn_preview.py` (FSRCNN x2, `models/FSRCNN_x2.onnx`) into `s.image`.
 - `s.image` stays full-size for the texture, video and UI; the GPU path is
   disabled in preview mode while BLA still accelerates the half-res render.
-  Upscale blocks the display thread ~1 s/frame.
+- Display never blocks: `preview_display_image()` shows a live bilinear upscale
+  of the half-res buffer until the worker publishes the neural result.
+  At most one upscale job is in flight; newest completed frame wins.
+- `--fullscreen` sizes the window to the desktop display mode (useful with
+  `--preview` so the half-res render still has detail).
 - Never use preview output as final output: it invents detail.
 
 ## Notes

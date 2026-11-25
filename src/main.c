@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -234,6 +235,18 @@ static struct image *preview_render_image = NULL;
 static i32 render_w = 0;
 static i32 render_h = 0;
 static char preview_root[2048] = { 0 };
+
+// The upscaler runs on its own thread so the display loop never blocks.
+static pthread_t preview_thread;
+static bool preview_thread_started = false;
+static pthread_mutex_t preview_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t preview_cond = PTHREAD_COND_INITIALIZER;
+static bool preview_stop = false;
+static bool preview_job_pending = false;
+static bool preview_result_ready = false;
+static struct image *preview_job_src = NULL;  // half-res snapshot for worker
+static struct image *preview_job_dst = NULL;  // full-res result from worker
+static struct image *preview_fast_image = NULL;  // live bilinear fallback
 
 // log2 safety margin between |dz| and a BLA step's validity radius.
 static f64 bla_margin = 16.0;
@@ -667,18 +680,15 @@ preview_read_ppm (const char *path, struct image *img)
 }
 
 
-// Blocks the display thread for about a second at 800x600.  Acceptable for
-// an interactive preview, never for a final render.
+// The slow FSRCNN pass.  Runs on the preview thread, never on the display
+// thread, so navigation stays responsive while the upscale is in flight.
 static void
-preview_upscale (void)
+preview_upscale_sync (const struct image *src, struct image *dst)
 {
-  if (!preview_mode || !preview_render_image)
-    return;
-
   const char *in = "/tmp/mandexplorer_preview_in.ppm";
   const char *out = "/tmp/mandexplorer_preview_out.ppm";
 
-  if (!preview_write_ppm (in, preview_render_image))
+  if (!preview_write_ppm (in, src))
     return;
 
   char cmd[8192];
@@ -691,7 +701,140 @@ preview_upscale (void)
   if (system (cmd) != 0)
     return;
 
-  preview_read_ppm (out, s.image);
+  preview_read_ppm (out, dst);
+}
+
+
+static void *
+preview_thread_main (void *arg)
+{
+  (void) arg;
+
+  for (;;)
+    {
+      pthread_mutex_lock (&preview_mutex);
+
+      while (!preview_job_pending && !preview_stop)
+        pthread_cond_wait (&preview_cond, &preview_mutex);
+
+      if (preview_stop)
+        {
+          pthread_mutex_unlock (&preview_mutex);
+          break;
+        }
+
+      preview_job_pending = false;
+      pthread_mutex_unlock (&preview_mutex);
+
+      preview_upscale_sync (preview_job_src, preview_job_dst);
+
+      pthread_mutex_lock (&preview_mutex);
+      preview_result_ready = true;
+      pthread_mutex_unlock (&preview_mutex);
+    }
+
+  return NULL;
+}
+
+
+static void preview_stop_thread (void);
+
+// (Re)allocate buffers and (re)start the worker.  Called at startup and after
+// a window resize; stopping the thread first avoids racing on the buffers.
+static void
+preview_restart (void)
+{
+  if (!preview_mode)
+    return;
+
+  preview_stop_thread ();
+
+  if (preview_job_src) image_destroy (preview_job_src);
+  if (preview_job_dst) image_destroy (preview_job_dst);
+  if (preview_fast_image) image_destroy (preview_fast_image);
+
+  preview_job_src = image_create (render_w, render_h);
+  preview_job_dst = image_create (s.w, s.h);
+  preview_fast_image = image_create (s.w, s.h);
+
+  preview_stop = false;
+  preview_job_pending = false;
+  preview_result_ready = false;
+
+  if (pthread_create (&preview_thread, NULL, preview_thread_main, NULL) == 0)
+    preview_thread_started = true;
+}
+
+
+static void
+preview_stop_thread (void)
+{
+  if (!preview_thread_started)
+    return;
+
+  pthread_mutex_lock (&preview_mutex);
+  preview_stop = true;
+  pthread_cond_signal (&preview_cond);
+  pthread_mutex_unlock (&preview_mutex);
+
+  pthread_join (preview_thread, NULL);
+  preview_thread_started = false;
+}
+
+
+static void
+preview_submit_job (void)
+{
+  if (!preview_mode || !preview_thread_started || !preview_render_image)
+    return;
+
+  pthread_mutex_lock (&preview_mutex);
+
+  // At most one job in flight; the newest completed frame wins.
+  if (!preview_job_pending)
+    {
+      image_copy (preview_render_image, preview_job_src);
+      preview_job_pending = true;
+      pthread_cond_signal (&preview_cond);
+    }
+
+  pthread_mutex_unlock (&preview_mutex);
+}
+
+
+// Returns the image the display should present this tick: the finished
+// neural upscale when available, otherwise a cheap live bilinear preview of
+// the half-res buffer so the zoom never freezes.
+static struct image *
+preview_display_image (void)
+{
+  if (!preview_mode)
+    return s.image;
+
+  bool have_result = false;
+
+  pthread_mutex_lock (&preview_mutex);
+  if (preview_result_ready)
+    {
+      image_copy (preview_job_dst, s.image);
+      preview_result_ready = false;
+      have_result = true;
+    }
+  pthread_mutex_unlock (&preview_mutex);
+
+  if (have_result || !preview_fast_image || !preview_render_image)
+    return s.image;
+
+  for (i32 y = 0; y < s.h; ++y)
+    for (i32 x = 0; x < s.w; ++x)
+      {
+        const f64 sx = ((f64) x + 0.5) * (f64) render_w / (f64) s.w - 0.5;
+        const f64 sy = ((f64) y + 0.5) * (f64) render_h / (f64) s.h - 0.5;
+        image_set2 (preview_fast_image, x, y,
+                    bilinear_sample (preview_render_image, sx, sy));
+      }
+
+  return preview_fast_image;
 }
 
 
@@ -1791,6 +1934,7 @@ help (FILE *f, const char *self)
   fprintf (f, "  --palette         <PALETTE>    Set the palette's path\n");
   fprintf (f, "  --no-gpu                       Disable GPU acceleration\n");
   fprintf (f, "  --preview                      Half-res render + FSRCNN x2 for display (preview only)\n");
+  fprintf (f, "  --fullscreen                   Use the desktop resolution as the window size\n");
   fprintf (f, "  --gpu-info                     Print GPU info and exit\n");
   fprintf (f, "\n");
   fprintf (f, "SCENE:\n");
@@ -1825,6 +1969,7 @@ main (i32 argc, char **argv)
   i32 initial_h = 600;
 
   bool no_gpu = false;
+  bool fullscreen = false;
   preview_mode = false;
   bool gpu_info = false;
 
@@ -2139,6 +2284,13 @@ main (i32 argc, char **argv)
           continue;
         }
 
+      if (strcmp (arg, "--fullscreen") == 0)
+        {
+          fullscreen = true;
+          ++i;
+          continue;
+        }
+
       if (strcmp (arg, "--gpu-info") == 0)
         {
           gpu_info = true;
@@ -2250,6 +2402,16 @@ main (i32 argc, char **argv)
   SDL_Init (SDL_INIT_VIDEO);
   TTF_Init ();
 
+  if (fullscreen)
+    {
+      SDL_DisplayMode mode;
+      if (SDL_GetDesktopDisplayMode (0, &mode) == 0)
+        {
+          initial_w = mode.w;
+          initial_h = mode.h;
+        }
+    }
+
   s.w = initial_w;
   s.h = initial_h;
 
@@ -2262,6 +2424,7 @@ main (i32 argc, char **argv)
     s.w,
     s.h,
     SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
+    | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0)
   );
 
   s.renderer = SDL_CreateRenderer (
@@ -2324,6 +2487,7 @@ main (i32 argc, char **argv)
 
   preview_init_root ();
   preview_update_dims ();
+  preview_restart ();
 
   gpu_vibe_image = image_create (s.w, s.h);
 
@@ -2789,6 +2953,7 @@ main (i32 argc, char **argv)
                 s.image = image_create (s.w, s.h);
 
                 preview_update_dims ();
+                preview_restart ();
 
                 if (gpu_vibe_image)
                   image_destroy (gpu_vibe_image);
@@ -3353,7 +3518,7 @@ main (i32 argc, char **argv)
             {
               compute_image_total = SDL_GetTicks () - compute_image_start;
 
-              preview_upscale ();
+              preview_submit_job ();
 
               const bool can_probe = auto_iter
                                      && !vibe
@@ -3472,6 +3637,8 @@ main (i32 argc, char **argv)
 
       if (vibe_upload_ok)
         {
+          struct image *shown = preview_display_image ();
+
           // Upload texture (atomic per-pixel read, safe for partial frames).
           {
             i32 pitch;
@@ -3479,12 +3646,12 @@ main (i32 argc, char **argv)
 
             SDL_LockTexture (s.texture, NULL, &pixels, &pitch);
 
-            for (i32 y = 0; y < s.image->h; ++y)
+            for (i32 y = 0; y < shown->h; ++y)
               {
                 u32 *row = (u32 *)((u8 *)pixels + (usize)y * (usize)pitch);
 
-                for (i32 x = 0; x < s.image->w; ++x)
-                  row[x] = image_get2 (s.image, x, y);
+                for (i32 x = 0; x < shown->w; ++x)
+                  row[x] = image_get2 (shown, x, y);
               }
 
             SDL_UnlockTexture (s.texture);
@@ -3662,8 +3829,12 @@ main (i32 argc, char **argv)
 
   image_destroy (s.image);
 
-  if (preview_render_image)
-    image_destroy (preview_render_image);
+  preview_stop_thread ();
+
+  if (preview_job_src) image_destroy (preview_job_src);
+  if (preview_job_dst) image_destroy (preview_job_dst);
+  if (preview_fast_image) image_destroy (preview_fast_image);
+  if (preview_render_image) image_destroy (preview_render_image);
 
   free (render_pixels);
   free (render_counts);
