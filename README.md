@@ -45,3 +45,29 @@ The GPU/OpenCL path is skipped while BLA is active: PoCL on the development
 host cannot compile the extended-exponent kernel, so rendering uses the CPU
 worker pool.
 
+## Neural preview (experimental)
+
+`tools/nn_preview.py` upscales a dumped frame x2 with a tiny FSRCNN ONNX
+model (`models/FSRCNN_x2.onnx`, 37 KB). It is intended **only** for a fast
+interactive preview, never for final output: a neural network invents detail
+that was not computed, which is unacceptable for a mathematical fractal.
+
+```bash
+python3 -m venv .venv-preview
+.venv-preview/bin/pip install numpy opencv-contrib-python-headless
+.venv-preview/bin/python tools/nn_preview.py in.ppm out.ppm
+```
+
+In-app preview uses the same model:
+
+```bash
+make
+./a --preview -w 800 -h 600 my_scene.sce
+```
+
+The window stays at the requested size; the fractal is computed at half
+resolution and upscaled with FSRCNN before display. The display thread blocks
+for about a second per completed frame, so this is for navigation only.
+The model comes from `opencv_extra` (converted from the Apache-2.0 FSRCNN
+TensorFlow model) and is included as `models/FSRCNN_x2.onnx`.
+

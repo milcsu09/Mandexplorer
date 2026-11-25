@@ -48,6 +48,15 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Capture buffer grows 256 -> 65536 views; a full buffer prints a message and
   renders immediately rather than silently dropping frames.
 
+## Neural preview
+- `--preview`: fractal is computed into `preview_render_image` at half of
+  `s.w x s.h`, then `preview_upscale()` pipes it through
+  `tools/nn_preview.py` (FSRCNN x2, `models/FSRCNN_x2.onnx`) into `s.image`.
+- `s.image` stays full-size for the texture, video and UI; the GPU path is
+  disabled in preview mode while BLA still accelerates the half-res render.
+  Upscale blocks the display thread ~1 s/frame.
+- Never use preview output as final output: it invents detail.
+
 ## Notes
 - `terminate()` called before state changes requiring recompute.
 - `apply_iter_max()` reallocates orbit buffers.

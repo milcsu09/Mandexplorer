@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <signal.h>
+#include <unistd.h>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
@@ -224,6 +225,15 @@ struct orbit_cache
 
 static struct orbit_cache orbit_cache;
 static struct bla_table bla_table;
+
+// Neural preview: render at half resolution, upscale with FSRCNN for display.
+// s.image stays full-size (UI, video, texture); preview_render_image is the
+// half-size render target.  Preview is never used for final output.
+static bool preview_mode = false;
+static struct image *preview_render_image = NULL;
+static i32 render_w = 0;
+static i32 render_h = 0;
+static char preview_root[2048] = { 0 };
 
 // log2 safety margin between |dz| and a BLA step's validity radius.
 static f64 bla_margin = 16.0;
@@ -555,6 +565,133 @@ dump_ppm (void)
       }
 
   fclose (f);
+}
+
+
+// Resolve the directory containing the binary so the preview helper works
+// regardless of the current working directory.
+static void
+preview_init_root (void)
+{
+  ssize_t n = readlink ("/proc/self/exe", preview_root, sizeof preview_root - 1);
+
+  if (n > 0)
+    {
+      preview_root[n] = '\0';
+      char *slash = strrchr (preview_root, '/');
+      if (slash) slash[1] = '\0';
+    }
+  else
+    strcpy (preview_root, "./");
+}
+
+
+static void
+preview_update_dims (void)
+{
+  if (preview_mode)
+    {
+      render_w = s.w / 2;
+      render_h = s.h / 2;
+
+      if (render_w < 1) render_w = 1;
+      if (render_h < 1) render_h = 1;
+
+      if (preview_render_image)
+        image_destroy (preview_render_image);
+
+      preview_render_image = image_create (render_w, render_h);
+    }
+  else
+    {
+      render_w = s.w;
+      render_h = s.h;
+    }
+}
+
+
+static bool
+preview_write_ppm (const char *path, const struct image *img)
+{
+  FILE *f = fopen (path, "wb");
+  if (!f)
+    return false;
+
+  fprintf (f, "P6\n%d %d\n255\n", img->w, img->h);
+
+  for (i32 y = 0; y < img->h; ++y)
+    for (i32 x = 0; x < img->w; ++x)
+      {
+        const u32 c = image_get2 (img, x, y);
+        const unsigned char rgb[3] = { color_r (c), color_g (c), color_b (c) };
+        fwrite (rgb, 1, 3, f);
+      }
+
+  fclose (f);
+  return true;
+}
+
+
+static bool
+preview_read_ppm (const char *path, struct image *img)
+{
+  FILE *f = fopen (path, "rb");
+  if (!f)
+    return false;
+
+  char magic[3] = { 0 };
+  i32 w = 0;
+  i32 h = 0;
+  i32 maxv = 0;
+  bool ok = fscanf (f, "%2s %d %d %d", magic, &w, &h, &maxv) == 4
+            && strcmp (magic, "P6") == 0
+            && w == img->w && h == img->h && maxv == 255;
+
+  if (ok)
+    fgetc (f); // single whitespace follows maxval
+
+  for (i32 y = 0; ok && y < h; ++y)
+    for (i32 x = 0; ok && x < w; ++x)
+      {
+        unsigned char rgb[3];
+        if (fread (rgb, 1, 3, f) != 3)
+          {
+            ok = false;
+            break;
+          }
+        image_set2 (img, x, y, color_rgb (rgb[0], rgb[1], rgb[2]));
+      }
+
+  fclose (f);
+  return ok;
+}
+
+
+// Blocks the display thread for about a second at 800x600.  Acceptable for
+// an interactive preview, never for a final render.
+static void
+preview_upscale (void)
+{
+  if (!preview_mode || !preview_render_image)
+    return;
+
+  const char *in = "/tmp/mandexplorer_preview_in.ppm";
+  const char *out = "/tmp/mandexplorer_preview_out.ppm";
+
+  if (!preview_write_ppm (in, preview_render_image))
+    return;
+
+  char cmd[8192];
+
+  snprintf (cmd, sizeof cmd,
+            "\"%s.venv-preview/bin/python\" \"%stools/nn_preview.py\" "
+            "%s %s > /tmp/mandexplorer_preview.log 2>&1",
+            preview_root, preview_root, in, out);
+
+  if (system (cmd) != 0)
+    return;
+
+  preview_read_ppm (out, s.image);
 }
 
 
@@ -1513,7 +1650,9 @@ worker (void *argument)
   const f64 sample = 1.0 / s.render_ss;
   const i32 samples = s.render_ss * s.render_ss;
 
-  const f64 scale = s.scene->width / s.w;
+  const f64 scale = s.scene->width / (f64) render_w;
+
+  struct image *target = preview_mode ? preview_render_image : s.image;
 
   const usize offset = work->offset;
   const usize stride = work->stride;
@@ -1538,8 +1677,8 @@ worker (void *argument)
             if (s.work_generation != atomic_load (&s.generation))
               return;
 
-            const f64 dx = (x - s.w / 2.0 + (sx + 0.5) * sample) * scale;
-            const f64 dy = (s.h / 2.0 - y - (sy + 0.5) * sample) * scale;
+            const f64 dx = (x - render_w / 2.0 + (sx + 0.5) * sample) * scale;
+            const f64 dy = (render_h / 2.0 - y - (sy + 0.5) * sample) * scale;
 
             f64 nx, ny;
             f64 nu = mandelbrot (dx, dy, &nx, &ny);
@@ -1565,7 +1704,7 @@ worker (void *argument)
             b += color_b (color) * shade;
           }
 
-      image_set2 (s.image, x, y, color_rgb (r / samples, g / samples, b / samples));
+      image_set2 (target, x, y, color_rgb (r / samples, g / samples, b / samples));
     }
 
   atomic_fetch_add (&s.tiles_done, 1);
@@ -1651,6 +1790,7 @@ help (FILE *f, const char *self)
   fprintf (f, "  --a               <float>      Set omnibrot's 'a' parameter (default 0.005)\n");
   fprintf (f, "  --palette         <PALETTE>    Set the palette's path\n");
   fprintf (f, "  --no-gpu                       Disable GPU acceleration\n");
+  fprintf (f, "  --preview                      Half-res render + FSRCNN x2 for display (preview only)\n");
   fprintf (f, "  --gpu-info                     Print GPU info and exit\n");
   fprintf (f, "\n");
   fprintf (f, "SCENE:\n");
@@ -1685,6 +1825,7 @@ main (i32 argc, char **argv)
   i32 initial_h = 600;
 
   bool no_gpu = false;
+  preview_mode = false;
   bool gpu_info = false;
 
   const char *scene_path = NULL;
@@ -1990,6 +2131,14 @@ main (i32 argc, char **argv)
           continue;
         }
 
+      if (strcmp (arg, "--preview") == 0)
+        {
+          preview_mode = true;
+          no_gpu = true;
+          ++i;
+          continue;
+        }
+
       if (strcmp (arg, "--gpu-info") == 0)
         {
           gpu_info = true;
@@ -2172,6 +2321,9 @@ main (i32 argc, char **argv)
     s.sectors = 4;
 
   s.image = image_create (s.w, s.h);
+
+  preview_init_root ();
+  preview_update_dims ();
 
   gpu_vibe_image = image_create (s.w, s.h);
 
@@ -2636,6 +2788,8 @@ main (i32 argc, char **argv)
 
                 s.image = image_create (s.w, s.h);
 
+                preview_update_dims ();
+
                 if (gpu_vibe_image)
                   image_destroy (gpu_vibe_image);
                 gpu_vibe_image = image_create (s.w, s.h);
@@ -3015,6 +3169,7 @@ main (i32 argc, char **argv)
               const bool use_gpu =
                 !vibe
                 && gpu_is_available ()
+                && !preview_mode
                 && gpu_should_use (s.w, s.h, s.render_ss, s.scene->iter_max,
                                    s.scene->width, s.formula, s.render_vibe);
 
@@ -3024,7 +3179,7 @@ main (i32 argc, char **argv)
               // kernel walks its own 2D grid, so this work is skipped there.
               if (!use_gpu)
                 {
-                  render_pixel_count = (usize)s.w * (usize)s.h;
+                  render_pixel_count = (usize) render_w * (usize) render_h;
 
                   if (render_pixel_count > render_pixels_cap)
                     {
@@ -3036,8 +3191,10 @@ main (i32 argc, char **argv)
                   if (render_pixels)
                     {
                       i32 maxr2 = 0;
-                      const i32 dxs[2] = { s.mouse_cx, s.w - 1 - s.mouse_cx };
-                      const i32 dys[2] = { s.mouse_cy, s.h - 1 - s.mouse_cy };
+                      const i32 mcx = preview_mode ? s.mouse_cx / 2 : s.mouse_cx;
+                      const i32 mcy = preview_mode ? s.mouse_cy / 2 : s.mouse_cy;
+                      const i32 dxs[2] = { mcx, render_w - 1 - mcx };
+                      const i32 dys[2] = { mcy, render_h - 1 - mcy };
 
                       for (i32 i = 0; i < 2; ++i)
                         for (i32 j = 0; j < 2; ++j)
@@ -3057,11 +3214,11 @@ main (i32 argc, char **argv)
                         {
                           memset (render_counts, 0, ((usize)maxr2 + 1) * sizeof (usize));
 
-                          for (i32 y = 0; y < s.h; ++y)
-                            for (i32 x = 0; x < s.w; ++x)
+                          for (i32 y = 0; y < render_h; ++y)
+                            for (i32 x = 0; x < render_w; ++x)
                               {
-                                const i32 dx = x - s.mouse_cx;
-                                const i32 dy = y - s.mouse_cy;
+                                const i32 dx = x - mcx;
+                                const i32 dy = y - mcy;
                                 const i32 r2 = dx * dx + dy * dy;
                                 render_counts[r2]++;
                               }
@@ -3074,11 +3231,11 @@ main (i32 argc, char **argv)
                               sum += c;
                             }
 
-                          for (i32 y = 0; y < s.h; ++y)
-                            for (i32 x = 0; x < s.w; ++x)
+                          for (i32 y = 0; y < render_h; ++y)
+                            for (i32 x = 0; x < render_w; ++x)
                               {
-                                const i32 dx = x - s.mouse_cx;
-                                const i32 dy = y - s.mouse_cy;
+                                const i32 dx = x - mcx;
+                                const i32 dy = y - mcy;
                                 const i32 r2 = dx * dx + dy * dy;
 
                                 render_pixels[render_counts[r2]].x = x;
@@ -3195,6 +3352,8 @@ main (i32 argc, char **argv)
           if (s.tiles_done == n_tiles ())
             {
               compute_image_total = SDL_GetTicks () - compute_image_start;
+
+              preview_upscale ();
 
               const bool can_probe = auto_iter
                                      && !vibe
@@ -3502,6 +3661,9 @@ main (i32 argc, char **argv)
     image_destroy (gpu_vibe_image);
 
   image_destroy (s.image);
+
+  if (preview_render_image)
+    image_destroy (preview_render_image);
 
   free (render_pixels);
   free (render_counts);
