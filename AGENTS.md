@@ -47,6 +47,13 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   recording at ~1300 frames once deep zoom made 2% steps smaller than it.
 - Capture buffer grows 256 -> 65536 views; a full buffer prints a message and
   renders immediately rather than silently dropping frames.
+- Each captured view stores its centre as **MPFR**, not a double. A double
+  centre near -1.75 has ~2e-16 resolution; once the zoom is deeper than that
+  (~frame 1500 from width 0.01 at 1.02/frame) the recorded target quantises to
+  neighbouring ulps, so the video zooms into the wrong point and keyframe
+  warps oscillate. `view_offset_px()` also works from the exact centres, and
+  `MANDEX_DUMP_VIEWS=1` dumps all recorded centres to
+  `/tmp/mandexplorer_views.txt` when rendering starts.
 
 ## Neural preview
 - `--preview`: fractal is computed into `preview_render_image` at half of

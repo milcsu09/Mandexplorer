@@ -269,6 +269,14 @@ static usize keyframe_render_index = 0;
 
 struct view_state
 {
+  // Exact view centre.  A plain double cannot hold it once the view width is
+  // below ~1 ulp of the centre (~2e-16 near -1.75): recorded frames then
+  // quantise to the same/p neighbouring doubles and a video zooms into the
+  // wrong point, with the keyframe warp oscillating between those ulps.
+  mpfr_t c_re_hi;
+  mpfr_t c_im_hi;
+
+  // Double snapshots, used only by the cheap iteration probes.
   f64 c_re;
   f64 c_im;
   f64 width;
@@ -292,6 +300,79 @@ struct view_state
 };
 
 
+static void
+view_state_init (struct view_state *v)
+{
+  mpfr_inits2 (FLOAT_PREC, v->c_re_hi, v->c_im_hi, (mpfr_ptr) NULL);
+}
+
+
+static void
+view_state_set_center (struct view_state *v, mpfr_srcptr re, mpfr_srcptr im)
+{
+  mpfr_set (v->c_re_hi, re, MPFR_RNDN);
+  mpfr_set (v->c_im_hi, im, MPFR_RNDN);
+  v->c_re = mpfr_get_d (re, MPFR_RNDN);
+  v->c_im = mpfr_get_d (im, MPFR_RNDN);
+}
+
+
+static void
+view_state_copy (struct view_state *dst, const struct view_state *src)
+{
+  dst->c_re = src->c_re;
+  dst->c_im = src->c_im;
+  dst->width = src->width;
+
+  dst->iter_max = src->iter_max;
+  dst->recorded_iter_max = src->recorded_iter_max;
+  dst->iter_per_color = src->iter_per_color;
+
+  dst->ss = src->ss;
+  dst->formula = src->formula;
+  dst->omni_a = src->omni_a;
+  dst->bailout = src->bailout;
+  dst->lx = src->lx;
+  dst->ly = src->ly;
+  dst->lz = src->lz;
+  dst->color_inside = src->color_inside;
+
+  mpfr_set (dst->c_re_hi, src->c_re_hi, MPFR_RNDN);
+  mpfr_set (dst->c_im_hi, src->c_im_hi, MPFR_RNDN);
+}
+
+
+static void
+view_state_clear (struct view_state *v)
+{
+  mpfr_clears (v->c_re_hi, v->c_im_hi, (mpfr_ptr) NULL);
+}
+
+
+// Pixel-space offset between two recorded views, computed from the exact
+// centres.  With double centres this difference is pure ulp noise once the
+// zoom is deep, which makes keyframe warps jump to the wrong place.
+static void
+view_offset_px (const struct view_state *v, const struct view_state *kv,
+                f64 *dx, f64 *dy)
+{
+  const f64 scale = (f64) s.w / kv->width;
+
+  mpfr_t t;
+  mpfr_init2 (t, FLOAT_PREC);
+
+  mpfr_sub (t, v->c_re_hi, kv->c_re_hi, MPFR_RNDN);
+  mpfr_mul_d (t, t, scale, MPFR_RNDN);
+  *dx = mpfr_get_d (t, MPFR_RNDN);
+
+  mpfr_sub (t, v->c_im_hi, kv->c_im_hi, MPFR_RNDN);
+  mpfr_mul_d (t, t, scale, MPFR_RNDN);
+  *dy = mpfr_get_d (t, MPFR_RNDN);
+
+  mpfr_clear (t);
+}
+
+
 static struct view_state *recorded_views = NULL;
 static usize recorded_count = 0;
 static usize recorded_cap = 0;
@@ -300,6 +381,20 @@ static bool recording = false;
 static bool rendering_video = false;
 static bool video_frame_pending = false;
 static usize render_index = 0;
+
+static void
+recorded_views_free (void)
+{
+  for (usize i = 0; i < recorded_count; ++i)
+    view_state_clear (&recorded_views[i]);
+
+  free (recorded_views);
+  recorded_views = NULL;
+  recorded_count = 0;
+  recorded_cap = 0;
+}
+
+
 
 static FILE *ffmpeg_pipe = NULL;
 static char video_path[256] = { 0 };
@@ -383,6 +478,27 @@ start_render_phase (void)
     {
       printf ("Rendering %zu recorded frames to '%s'\n",
               recorded_count, video_path);
+    }
+
+  if (getenv ("MANDEX_DUMP_VIEWS"))
+    {
+      FILE *f = fopen ("/tmp/mandexplorer_views.txt", "w");
+
+      if (f)
+        {
+          for (usize i = 0; i < recorded_count; ++i)
+            {
+              const struct view_state *v = &recorded_views[i];
+
+              fprintf (f, "%zu %.17e ", i, v->width);
+              mpfr_out_str (f, 10, 0, v->c_re_hi, MPFR_RNDN);
+              fputc (' ', f);
+              mpfr_out_str (f, 10, 0, v->c_im_hi, MPFR_RNDN);
+              fputc ('\n', f);
+            }
+
+          fclose (f);
+        }
     }
 }
 
@@ -471,11 +587,12 @@ can_reuse_keyframe (const struct view_state *kv, const struct view_state *v)
   if (kv->lz != v->lz) return false;
 
   const f64 S = v->width / kv->width;
-  const f64 Dx = v->c_re - kv->c_re;
-  const f64 Dy = v->c_im - kv->c_im;
 
-  const f64 cx = (s.w / 2.0) * (1.0 - S) + Dx * s.w / kv->width;
-  const f64 cy = (s.h / 2.0) * (1.0 - S) - Dy * s.w / kv->width;
+  f64 Dx, Dy;
+  view_offset_px (v, kv, &Dx, &Dy);
+
+  const f64 cx = (s.w / 2.0) * (1.0 - S) + Dx;
+  const f64 cy = (s.h / 2.0) * (1.0 - S) - Dy;
 
   if (cx < 0 || (f64)s.w * S + cx > (f64)s.w - 1) return false;
   if (cy < 0 || (f64)s.h * S + cy > (f64)s.h - 1) return false;
@@ -534,11 +651,12 @@ static void
 warp_keyframe (const struct view_state *kv, const struct view_state *v)
 {
   const f64 S = v->width / kv->width;
-  const f64 Dx = v->c_re - kv->c_re;
-  const f64 Dy = v->c_im - kv->c_im;
 
-  const f64 cx = (s.w / 2.0) * (1.0 - S) + Dx * s.w / kv->width;
-  const f64 cy = (s.h / 2.0) * (1.0 - S) - Dy * s.w / kv->width;
+  f64 Dx, Dy;
+  view_offset_px (v, kv, &Dx, &Dy);
+
+  const f64 cx = (s.w / 2.0) * (1.0 - S) + Dx;
+  const f64 cy = (s.h / 2.0) * (1.0 - S) - Dy;
 
   for (i32 y = 0; y < s.h; ++y)
     {
@@ -2512,6 +2630,7 @@ main (i32 argc, char **argv)
 
   orbit_cache.valid = false;
   mpfr_inits2 (FLOAT_PREC, orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
+  view_state_init (&keyframe_view);
 
   s.sectors = SDL_GetCPUCount ();
 
@@ -2561,30 +2680,27 @@ main (i32 argc, char **argv)
 
       if (recorded_views)
         {
-          const f64 c_re = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
-          const f64 c_im = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
           f64 width = s.scene->width;
 
           for (usize i = 0; i < auto_frames; ++i)
             {
-              struct view_state vs = { 0 };
+              struct view_state *v = &recorded_views[recorded_count++];
 
-              vs.c_re = c_re;
-              vs.c_im = c_im;
-              vs.width = width;
-              vs.iter_max = s.scene->iter_max;
-              vs.recorded_iter_max = s.scene->iter_max;
-              vs.iter_per_color = s.scene->iter_per_color;
-              vs.ss = s.ss;
-              vs.formula = s.formula;
-              vs.omni_a = s.omni_a;
-              vs.bailout = s.scene->bailout;
-              vs.lx = s.scene->lx;
-              vs.ly = s.scene->ly;
-              vs.lz = s.scene->lz;
-              vs.color_inside = color_inside;
+              view_state_init (v);
+              view_state_set_center (v, s.scene->c_re, s.scene->c_im);
 
-              recorded_views[recorded_count++] = vs;
+              v->width = width;
+              v->iter_max = s.scene->iter_max;
+              v->recorded_iter_max = s.scene->iter_max;
+              v->iter_per_color = s.scene->iter_per_color;
+              v->ss = s.ss;
+              v->formula = s.formula;
+              v->omni_a = s.omni_a;
+              v->bailout = s.scene->bailout;
+              v->lx = s.scene->lx;
+              v->ly = s.scene->ly;
+              v->lz = s.scene->lz;
+              v->color_inside = color_inside;
 
               width /= 1.02;
             }
@@ -2837,10 +2953,7 @@ main (i32 argc, char **argv)
 
                 if (!recording)
                   {
-                    free (recorded_views);
-                    recorded_views = NULL;
-                    recorded_count = 0;
-                    recorded_cap = 0;
+                    recorded_views_free ();
 
                     recording = true;
 
@@ -3094,29 +3207,25 @@ main (i32 argc, char **argv)
       // Capture effective view while recording.
       if (recording && !rendering_video)
         {
-          struct view_state vs;
+          mpfr_t eff_re, eff_im;
+          mpfr_inits2 (FLOAT_PREC, eff_re, eff_im, (mpfr_ptr) NULL);
 
-          vs.c_re = s.center_re + s.pan_x * s.scene->width / (f64)s.w;
-          vs.c_im = s.center_im - s.pan_y * s.scene->width / (f64)s.w;
-          vs.width = s.scene->width / (s.scale == 0.0 ? 1.0 : s.scale);
+          // Capture the exact centre the renderer uses (the MPFR scene centre
+          // plus the uncommitted pan).  s.center_re is only a double snapshot
+          // and quantises the zoom target once the view is deeper than an ulp.
+          mpfr_add_d (eff_re, s.scene->c_re,
+                      s.pan_x * s.scene->width / (f64) s.w, MPFR_RNDN);
+          mpfr_sub_d (eff_im, s.scene->c_im,
+                      s.pan_y * s.scene->width / (f64) s.w, MPFR_RNDN);
 
-          vs.iter_max = s.scene->iter_max;
-          vs.iter_per_color = s.scene->iter_per_color;
-          vs.ss = s.ss;
-          vs.formula = s.formula;
-          vs.omni_a = s.omni_a;
-          vs.bailout = s.scene->bailout;
-          vs.lx = s.scene->lx;
-          vs.ly = s.scene->ly;
-          vs.lz = s.scene->lz;
-          vs.color_inside = color_inside;
+          const f64 width = s.scene->width / (s.scale == 0.0 ? 1.0 : s.scale);
 
           // A view is a duplicate only when it moved by less than a
           // thousandth of a pixel.  The old fixed 1e-12 tolerance was
           // absolute: once the zoom was deeper than ~5e-11 it exceeded a
           // whole 2% zoom step, so every frame was silently dropped and
           // recording froze at ~1300 frames.
-          const f64 view_tol = vs.width / (f64) s.w * 1e-3;
+          const f64 view_tol = width / (f64) s.w * 1e-3;
 
           bool dup = false;
 
@@ -3124,12 +3233,23 @@ main (i32 argc, char **argv)
             {
               struct view_state *last = &recorded_views[recorded_count - 1];
 
-              if (last->iter_max == vs.iter_max
-                  && last->ss == vs.ss
-                  && last->formula == vs.formula
-                  && fabs (last->c_re - vs.c_re) <= view_tol
-                  && fabs (last->c_im - vs.c_im) <= view_tol
-                  && fabs (last->width - vs.width) <= view_tol)
+              mpfr_t d, tol;
+              mpfr_inits2 (FLOAT_PREC, d, tol, (mpfr_ptr) NULL);
+              mpfr_set_d (tol, view_tol, MPFR_RNDN);
+
+              mpfr_sub (d, last->c_re_hi, eff_re, MPFR_RNDN);
+              const bool same_re = mpfr_cmpabs (d, tol) <= 0;
+
+              mpfr_sub (d, last->c_im_hi, eff_im, MPFR_RNDN);
+              const bool same_im = mpfr_cmpabs (d, tol) <= 0;
+
+              mpfr_clears (d, tol, (mpfr_ptr) NULL);
+
+              if (last->iter_max == s.scene->iter_max
+                  && last->ss == s.ss
+                  && last->formula == s.formula
+                  && same_re && same_im
+                  && fabs (last->width - width) <= view_tol)
                 dup = true;
             }
 
@@ -3137,6 +3257,7 @@ main (i32 argc, char **argv)
             {
               if (recorded_count == recorded_cap)
                 {
+                  const usize old_cap = recorded_cap;
                   usize new_cap = recorded_cap ? recorded_cap * 2 : 256;
 
                   if (new_cap > 65536)
@@ -3151,13 +3272,34 @@ main (i32 argc, char **argv)
                         {
                           recorded_views = nv;
                           recorded_cap = new_cap;
+
+                          for (usize i = old_cap; i < new_cap; ++i)
+                            view_state_init (&recorded_views[i]);
                         }
                     }
                 }
 
               if (recorded_count < recorded_cap)
                 {
-                  recorded_views[recorded_count++] = vs;
+                  struct view_state *v = &recorded_views[recorded_count++];
+
+                  mpfr_set (v->c_re_hi, eff_re, MPFR_RNDN);
+                  mpfr_set (v->c_im_hi, eff_im, MPFR_RNDN);
+
+                  v->c_re = mpfr_get_d (eff_re, MPFR_RNDN);
+                  v->c_im = mpfr_get_d (eff_im, MPFR_RNDN);
+                  v->width = width;
+
+                  v->iter_max = s.scene->iter_max;
+                  v->iter_per_color = s.scene->iter_per_color;
+                  v->ss = s.ss;
+                  v->formula = s.formula;
+                  v->omni_a = s.omni_a;
+                  v->bailout = s.scene->bailout;
+                  v->lx = s.scene->lx;
+                  v->ly = s.scene->ly;
+                  v->lz = s.scene->lz;
+                  v->color_inside = color_inside;
                 }
               else
                 {
@@ -3169,6 +3311,8 @@ main (i32 argc, char **argv)
                   start_render_phase ();
                 }
             }
+
+          mpfr_clears (eff_re, eff_im, (mpfr_ptr) NULL);
         }
 
       // Schedule the next frame of the video render.
@@ -3210,8 +3354,8 @@ main (i32 argc, char **argv)
               s.scene->bailout = v->bailout;
               s.scene->width = v->width;
 
-              mpfr_set_d (s.scene->c_re, v->c_re, MPFR_RNDN);
-              mpfr_set_d (s.scene->c_im, v->c_im, MPFR_RNDN);
+              mpfr_set (s.scene->c_re, v->c_re_hi, MPFR_RNDN);
+              mpfr_set (s.scene->c_im, v->c_im_hi, MPFR_RNDN);
 
               s.scene->lx = v->lx;
               s.scene->ly = v->ly;
@@ -3225,8 +3369,8 @@ main (i32 argc, char **argv)
               s.pan_y = 0.0;
               s.scale = 1.0;
 
-              s.center_re = v->c_re;
-              s.center_im = v->c_im;
+              s.center_re = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
+              s.center_im = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
 
               // Keep adaptive iterations active while rendering video: they
               // are exactly what keeps deep frames from blowing up the
@@ -3637,7 +3781,7 @@ main (i32 argc, char **argv)
           if (keyframe_pending)
             {
               image_copy (s.image, keyframe_image);
-              keyframe_view = recorded_views[render_index];
+              view_state_copy (&keyframe_view, &recorded_views[render_index]);
               has_keyframe = true;
               keyframe_pending = false;
               keyframe_render_index = render_index;
@@ -3854,7 +3998,8 @@ main (i32 argc, char **argv)
       ffmpeg_pipe = NULL;
     }
 
-  free (recorded_views);
+  recorded_views_free ();
+  view_state_clear (&keyframe_view);
 
   terminate ();
 
