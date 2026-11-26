@@ -26,16 +26,7 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 ## Vibe zoom
 - The display thread only presents the last complete texture; orbit and GPU/CPU rendering run outside it.
 - A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
-- Zoom defaults to 1.02 per frame (`--vibe-step <float>` overrides it; lower =
-  smoother preview, slower zoom). Final quality (`iter_max`/SSAA/resolution)
-  is unchanged.
-- The zoom anchor is captured when vibe starts (`vibe_set_anchor()`); the live
-  mouse position is not followed, so pointer jitter on remote desktops cannot
-  shake the camera. Pointer outside the window means zoom into the centre.
-- The view shown by the current frame is kept in MPFR (`disp_base_*`), as is
-  the view its successor is rendered from (`render_base_*`). The scene is
-  rebased at render start, and pan/scale are recomputed from the exact views
-  when a frame completes, so the visible zoom never snaps backwards.
+- Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
 - `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
 - `orbit_ready` stays true after a render, so queueing `compute_orbit` must
   clear it first; otherwise the next tick starts render workers while
@@ -78,14 +69,10 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Display never blocks: `preview_display_image()` shows a live bilinear upscale
   of the half-res buffer until the worker publishes the neural result.
   At most one upscale job is in flight; newest completed frame wins.
-  During vibe the FSRCNN frame is deliberately **not** displayed: it arrives
-  ~1/s while the camera commits ~13/s, which snapped the view backwards at
-  every commit. Instead the freshly completed half-res frame is bilinearly
-  upscaled (`preview_render_gen`) immediately and the display's pan/scale
-  transform zooms it smoothly between frames. `preview_active()` is false
-  while recording/video rendering.
-  Preview texture uploads are skipped when the displayed pixels did not change
-  (`preview_upload_gen`), removing a full-screen 60 Hz copy.
+  After the first neural result the last complete frame stays on screen until
+  the next one arrives (no flicker back to the partial bilinear image), and
+  the half-res buffer is cleared at every commit so vibe frames do not leave
+  stale pixels. `preview_active()` is false while recording/video rendering.
 - `--fullscreen` sizes the window to the desktop display mode (useful with
   `--preview` so the half-res render still has detail).
 - Never use preview output as final output: it invents detail.
