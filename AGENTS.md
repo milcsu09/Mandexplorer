@@ -78,6 +78,8 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   `/tmp/mandexplorer_views.txt` when rendering starts.
 - Preview is suspended for the whole recording/video render: frames are
   rendered at full `s.w x s.h` into `s.image`, never through FSRCNN.
+- A keyframe is warped instead of a full render for up to 10 consecutive
+  frames (`keyframe_max_reuse`, was 5); override with `MANDEX_DIFF_REUSE=N`.
 
 ## Reverse video
 - `Shift+R` or `--reverse-video TARGET.sce` generates the zoom trajectory

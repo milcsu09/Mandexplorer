@@ -49,7 +49,7 @@
 
 // Number of video frames served by one full keyframe render.  Overridable
 // for A/B measurement through MANDEX_DIFF_REUSE.
-static i32 keyframe_max_reuse = 5;
+static i32 keyframe_max_reuse = 10;
 
 // Adaptive iteration control.
 //
