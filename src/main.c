@@ -29,10 +29,15 @@
 
 // #define FONT_PATH "res/Iosevka-Regular.ttf"
 
-#define MAX_ITER_MAX 16777216
+#define MAX_ITER_MAX 33554432
 
 // Omnibrot: z <- z^2 * exp (a / z) + c
 #define OMNIBROT_A_DEFAULT 0.005
+
+// A vibe render can take a minute at deep zoom.  Without this cap the
+// display transform keeps multiplying by 1.02 every frame and the rebase
+// divides width by ~1e27 instead of ~1.02 -- a huge zoom jump.
+#define VIBE_MAX_STALE_SCALE  1.2
 
 #define ORBIT_REUSE_EPS       1e-3
 #define ORBIT_REUSE_DEEP_EPS  0.5
@@ -178,6 +183,7 @@ static _Atomic bool gpu_vibe_inflight;
 // the next full render is ready.  Uploading the stale image over the baked
 // pixels is what makes the view snap back on every rebase.
 static bool canvas_frozen = false;
+static bool vibe_rendering = false;
 
 // File scope so the preview path knows whether this is a vibe stream.
 static bool vibe = false;
@@ -447,6 +453,7 @@ terminate (void)
   atomic_store (&s.tiles_done, 0);
 
   canvas_frozen = false;
+  vibe_rendering = false;
 }
 
 
@@ -3117,7 +3124,10 @@ main (i32 argc, char **argv)
               case SDLK_v:
                 vibe = !vibe;
                 if (!vibe)
-                  canvas_frozen = false;
+                  {
+                    canvas_frozen = false;
+                    vibe_rendering = false;
+                  }
                 printf ("Vibe zoom: %s\n", vibe ? "on" : "off");
 
                 if (vibe)
@@ -3565,13 +3575,17 @@ main (i32 argc, char **argv)
           const f64 sx = mx - s.w / 2.0;
           const f64 sy = my - s.h / 2.0;
 
-          const f64 zoom = 1.02;
-
-          const f64 world_x = (sx / s.scale) + s.pan_x;
-          const f64 world_y = (sy / s.scale) + s.pan_y;
-          s.scale *= zoom;
-          s.pan_x = world_x - (sx / s.scale);
-          s.pan_y = world_y - (sy / s.scale);
+          // Do not magnify a stale frame while a render is running past the
+          // small guard: the accumulated factor would be baked into the
+          // scene at rebase and appear as a giant zoom jump.
+          if (!(vibe_rendering && s.scale >= VIBE_MAX_STALE_SCALE))
+            {
+              const f64 world_x = (sx / s.scale) + s.pan_x;
+              const f64 world_y = (sy / s.scale) + s.pan_y;
+              s.scale *= 1.02;
+              s.pan_x = world_x - (sx / s.scale);
+              s.pan_y = world_y - (sy / s.scale);
+            }
 
           // Adopt a finished background GPU frame at an idle boundary; never
           // while CPU workers are filling s.image.  Renders are no longer
@@ -3850,6 +3864,8 @@ main (i32 argc, char **argv)
               probe_formula = s.formula;
 
               s.phase = PHASE_COMPUTE_ORBIT;
+              if (vibe)
+                vibe_rendering = true;
 
               bool cache_hit = false;
 
@@ -4131,6 +4147,7 @@ main (i32 argc, char **argv)
 
               // The buffer now holds a full frame for the current scene.
               canvas_frozen = false;
+              vibe_rendering = false;
 
               preview_submit_job ();
 

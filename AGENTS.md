@@ -51,6 +51,14 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   a view width (`ORBIT_REUSE_DEEP_EPS`) and BLA is rebuilt for the new delta;
   final renders keep the strict check so they stay pixel-identical.
 
+## Iteration ceiling
+- `MAX_ITER_MAX` is **33554432** (2^25, was 2^24). It is a hard clamp in
+  `apply_iter_max()`, the adaptive controller and the reverse-video generator;
+  the `.sce` format and `--iter-max` itself have no such limit.
+- The orbit is stored as two `f64` arrays (`16 bytes/iteration`), so 2^25 needs
+  ~536 MB just for the orbit plus ~600 MB for BLA. Larger values require
+  checkpointing or a disk-backed orbit rather than just raising the constant.
+
 ## BLA acceleration
 - `src/bla.c`/`bla.h`: second-order bilinear approximation of the reference
   orbit, with double mantissa + explicit binary exponent for coefficients.
