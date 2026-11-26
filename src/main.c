@@ -35,6 +35,7 @@
 #define OMNIBROT_A_DEFAULT 0.005
 
 #define ORBIT_REUSE_EPS       1e-3
+#define ORBIT_REUSE_DEEP_EPS  0.5
 #define ORBIT_REUSE_MIN_WIDTH 1e-10
 
 #define VIDEO_FIT_MAX_ATTEMPTS    3
@@ -3588,39 +3589,58 @@ main (i32 argc, char **argv)
 
               s.phase = PHASE_COMPUTE_ORBIT;
 
-                  bool cache_hit = false;
+              bool cache_hit = false;
 
               if (s.formula == FORMULA_MANDELBROT
                   && orbit_cache.valid
                   && orbit_cache.iter_max == s.scene->iter_max)
                 {
-                  const f64 cur_re = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
-                  const f64 cur_im = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
+                  // A double subtraction of two centres near -1.75 loses all
+                  // signal at deep zoom (quantum ~2e-16, view ~1e-31).  Take
+                  // the delta from the exact MPFR centres instead: 1e-32 is
+                  // still a perfectly good double.
+                  mpfr_t d_re, d_im;
+                  mpfr_inits2 (FLOAT_PREC, d_re, d_im, (mpfr_ptr) NULL);
+                  mpfr_sub (d_re, s.scene->c_re, orbit_cache.c_re, MPFR_RNDN);
+                  mpfr_sub (d_im, s.scene->c_im, orbit_cache.c_im, MPFR_RNDN);
 
-                  const f64 dc_re = cur_re - orbit_cache.c_re_d;
-                  const f64 dc_im = cur_im - orbit_cache.c_im_d;
+                  const f64 dc_re = mpfr_get_d (d_re, MPFR_RNDN);
+                  const f64 dc_im = mpfr_get_d (d_im, MPFR_RNDN);
                   const f64 width = s.scene->width;
+                  const f64 shift = hypot (dc_re, dc_im);
+                  // The relaxed deep-view threshold is a navigation-only
+                  // optimisation.  Final renders keep the strict check so
+                  // their output stays pixel-identical.
+                  const f64 eps = (width > ORBIT_REUSE_MIN_WIDTH || !vibe)
+                                  ? ORBIT_REUSE_EPS : ORBIT_REUSE_DEEP_EPS;
 
-                  if (dc_re == 0.0 && dc_im == 0.0
-                      && mpfr_equal_p (orbit_cache.c_re, s.scene->c_re)
-                      && mpfr_equal_p (orbit_cache.c_im, s.scene->c_im))
+                  if (mpfr_zero_p (d_re) && mpfr_zero_p (d_im))
                     {
                       delta_c_re = 0.0;
                       delta_c_im = 0.0;
                       cache_hit = true;
                     }
-                  else if (width > ORBIT_REUSE_MIN_WIDTH
-                           && fabs (dc_re) / width < ORBIT_REUSE_EPS
-                           && fabs (dc_im) / width < ORBIT_REUSE_EPS)
+                  else if (shift <= width * eps)
                     {
                       delta_c_re = dc_re;
                       delta_c_im = dc_im;
                       cache_hit = true;
                     }
+
+                  mpfr_clears (d_re, d_im, (mpfr_ptr) NULL);
                 }
 
               if (cache_hit)
                 {
+                  // The orbit is unchanged, but BLA's entry radius depends on
+                  // both the delta and the current width.
+                  if (vibe && bla_enabled && s.scene->width <= 1e-12)
+                    bla_build (&bla_table, s.orbit_re, s.orbit_im,
+                               s.scene->iter_max,
+                               s.scene->width * 0.75
+                               + hypot (delta_c_re, delta_c_im),
+                               bla_margin);
+
                   atomic_store (&s.orbit_ready, true);
                 }
               else

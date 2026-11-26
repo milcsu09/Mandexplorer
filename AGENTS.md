@@ -40,6 +40,11 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - `orbit_ready` stays true after a render, so queueing `compute_orbit` must
   clear it first; otherwise the next tick starts render workers while
   `compute_orbit` rebuilds `bla_table` (use-after-free in `bla_try_skip`).
+- The reference-orbit delta is computed from the exact MPFR centres, not as a
+  double subtraction (which quantises to ~2e-16 and is useless at deep zoom).
+  In vibe only, the orbit is reused while the cached centre stays within half
+  a view width (`ORBIT_REUSE_DEEP_EPS`) and BLA is rebuilt for the new delta;
+  final renders keep the strict check so they stay pixel-identical.
 
 ## BLA acceleration
 - `src/bla.c`/`bla.h`: second-order bilinear approximation of the reference
