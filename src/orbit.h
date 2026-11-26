@@ -19,7 +19,21 @@
 // 16 bytes/iteration.
 
 #define ORBIT_STRIDE 4096
-#define ORBIT_FLAT_BUDGET ((usize) 300u * 1024u * 1024u)
+// 2^25 iterations need 512 MiB + 16 bytes for the mirror.  Without it BLA
+// rebuilds regenerate the whole orbit through MPFR on every vibe frame, which
+// is far more expensive than the mirror itself.
+#define ORBIT_FLAT_BUDGET ((usize) 640u * 1024u * 1024u)
+
+// A period candidate is an iteration where |z| reaches a new record minimum.
+// an/bn are the first-order perturbation coefficients accumulated up to that
+// iteration (log2 magnitudes); they are the raw material for stage 3 (PA).
+struct orbit_period
+{
+  u64 iter;
+  f64 z2;
+  f64 an_log2;
+  f64 bn_log2;
+};
 
 struct orbit
 {
@@ -36,6 +50,13 @@ struct orbit
   f64 *flat_im;
   u64 flat_cap;          // allocated iterations, reused across regenerations
   u64 version;           // bumped whenever the orbit is regenerated
+
+  // Stage 2 (FPG): record-min period candidates and the first iteration where
+  // the linear perturbation no longer covers dcMax.
+  struct orbit_period *periods;
+  usize period_count;
+  usize period_cap;
+  u64 fpg_limit;
 };
 
 // Return true to abandon generation (the caller changed generation).
@@ -46,13 +67,17 @@ void orbit_clear (struct orbit *o);
 void orbit_invalidate (struct orbit *o);
 
 bool orbit_generate (struct orbit *o, u64 n, const mpfr_t c_re,
-                     const mpfr_t c_im, mpfr_prec_t prec, bool allow_flat,
-                     orbit_cancel_fn cancel, void *cancel_arg);
+                     const mpfr_t c_im, mpfr_prec_t prec, f64 dc_max,
+                     bool allow_flat, orbit_cancel_fn cancel, void *cancel_arg);
 
 // Thread-safe: each calling thread owns its own regenerating window.
 bool orbit_at (struct orbit *o, u64 j, f64 *re, f64 *im);
 
 bool orbit_has_flat (const struct orbit *o);
 u64 orbit_stride (const struct orbit *o);
+
+usize orbit_period_count (const struct orbit *o);
+bool orbit_period_at (const struct orbit *o, usize i, struct orbit_period *out);
+u64 orbit_fpg_limit (const struct orbit *o);
 
 #endif // ORBIT_H

@@ -56,20 +56,28 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   is stored every `ORBIT_STRIDE` (4096) iterations; doubles are regenerated on
   demand by a per-thread window using the **same MPFR ops and precision**, so
   every orbit value is bit-identical to the old representation.
-- Scenes with `N <= ~19M` also get an f64 mirror filled during the same MPFR
-  pass (zero extra cost), keeping old speed and the GPU path. Larger scenes
-  use checkpoints only; memory is ~64 bytes per 4096 iterations instead of
-  16 bytes per iteration (2^25 renders at ~155 MB RSS instead of ~690 MB).
+- Scenes with `N <= 2^25` also get an f64 mirror filled during the same MPFR
+  pass (zero extra cost), keeping old speed and the GPU path. The 640 MiB
+  budget is deliberate: without the mirror `bla_build()` regenerates every
+  orbit value through MPFR on **each vibe rebase** (~33.5M MPFR steps per
+  frame at 2^25). Above 2^25 only checkpoints are kept (~64 bytes per 4096
+  iterations instead of 16 bytes per iteration).
 - If the flat mirror is absent the GPU is disabled (its kernel indexes an
   arbitrary orbit position). The flat buffers are reused across regenerations
   so an in-flight async GPU job never reads freed memory.
 - `MANDEX_ORBIT_FLAT=0` forces checkpoint-only mode at any N;
   `MANDEX_ORBIT_STRIDE=N` overrides the checkpoint interval (32..1M).
+- Stage 2 (FPG): record-min `|z|^2` period candidates are always collected in
+  `orbit->periods` (one comparison/iteration). The expensive extended-exponent
+  `an`/`bn` guard is opt-in via `MANDEX_FPG=1`; `MANDEX_DUMP_PERIODS=N` prints
+  candidates and `fpg_limit`. Groundwork for stage 3 PA, no render change.
 - Pixel-identity regression (`--reverse-video` + `MANDEX_DUMP`, 64x48,
   `palettes/big.pal`): default.sce `3759b222515d7334179e8d76fbb53266`,
   deep scene `20261126_071203.sce` `96ac31aeb421f2737a2289edd38d19e3`,
   mid-deep `20261126_002836.sce` `63d350482e6c3d1ba52689a0ef075154`
-  (the last two also pass with `MANDEX_ORBIT_FLAT=0`).
+  (the last two also pass with `MANDEX_ORBIT_FLAT=0`). The 2^25 scene
+  `20261126_091423.sce` at 32x24 gives `d520021bc6b466f38ac395d27ca621e9`,
+  45 s after the budget fix vs 47 s for the pre-stage-1 binary (>180 s broken).
 - This stage removes the memory wall but NOT the O(N) time wall: generating
   checkpoints still walks every iteration, so 10^16 needs stages 3-4
   (rebase + MPA skips) as well.

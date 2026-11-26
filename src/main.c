@@ -1369,7 +1369,7 @@ compute_orbit (void *argument)
 
   if (!orbit_generate (&reference_orbit, s.scene->iter_max,
                        s.scene->c_re, s.scene->c_im, orbit_precision (),
-                       orbit_flat_allowed, orbit_cancelled, NULL))
+                       s.scene->width, orbit_flat_allowed, orbit_cancelled, NULL))
     {
       // A failed flat-mirror allocation must not stall the phase machine.
       // Retry checkpoint-only; bail out only if the generation changed.
@@ -1378,7 +1378,7 @@ compute_orbit (void *argument)
 
       if (!orbit_generate (&reference_orbit, s.scene->iter_max,
                            s.scene->c_re, s.scene->c_im, orbit_precision (),
-                           false, orbit_cancelled, NULL))
+                           s.scene->width, false, orbit_cancelled, NULL))
         return;
     }
 

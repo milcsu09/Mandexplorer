@@ -252,7 +252,11 @@ refIteration += pa.skip;
    default / deep BLA / mid-deep BLA дают те же MD5, в том числе с
    `MANDEX_ORBIT_FLAT=0`. Ограничение: время генерации всё ещё O(N), поэтому
    один этот этап 10^16 не даёт.
-2. FPG period detection — record-min `|z|²` в `compute_orbit()`.
+2. ✅ **Сделано:** record-min `|z|²` кандидаты в `orbit->periods` (всегда,
+   одно сравнение на итерацию) + extended-exponent `an`/`bn` и guard
+   `|bn|·dcMax > |z|²` (`fpg_limit`). Тяжёлая часть — только под `MANDEX_FPG=1`,
+   чтобы не платить ~2 `frexp`/`ldexp`/`log2` на итерацию в обычном рендере.
+   `MANDEX_DUMP_PERIODS=N` печатает кандидатов. Рендер не изменён, MD5 те же.
 3. PA 1-го порядка с `radius`, `dcMax`, normalize (`struct h`).
 4. MPA-иерархия + таблица + mapper + runtime lookup вместо `bla_try_skip`.
 5. SRPC сжатие.
