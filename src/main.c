@@ -162,6 +162,16 @@ static struct
 } s;
 
 
+// Two independent view transforms:
+//   s.pan/s.scale      -> maps the image currently on screen to the live view
+//   render_pan/scale   -> maps the scene centre (base of the frame being
+//                         rendered) to the live view.
+// They differ while a render is in flight.  Baking/clearing only the render
+// transform at commit keeps the displayed image from snapping backwards.
+static f64 render_pan_x = 0.0;
+static f64 render_pan_y = 0.0;
+static f64 render_scale = 1.0;
+
 static struct point *render_pixels = NULL;
 static usize render_pixel_count = 0;
 static usize render_pixels_cap = 0;
@@ -255,6 +265,9 @@ static u32 preview_fast_stamp = 0;
 // fractal frame as soon as it exists, instead of a ~1 s old neural upscale.
 static u32 preview_render_gen = 0;
 static u32 preview_fast_gen = 0;
+// Incremented whenever the pixels of the image handed to the display change;
+// lets the SDL texture upload be skipped on unchanged preview frames.
+static u32 preview_upload_gen = 0;
 // Once a neural frame exists we keep presenting it while idle.  During vibe
 // the live render is shown instead (see preview_display_image).
 static bool preview_final_valid = false;
@@ -979,6 +992,7 @@ preview_refresh_fast (void)
 
   preview_fast_stamp = SDL_GetTicks ();
   preview_fast_gen = preview_render_gen;
+  ++preview_upload_gen;
 }
 
 
@@ -1015,6 +1029,7 @@ preview_display_image (bool vibe)
       preview_result_ready = false;
       have_result = true;
       preview_final_valid = true;
+      ++preview_upload_gen;
     }
   pthread_mutex_unlock (&preview_mutex);
 
@@ -2721,6 +2736,10 @@ main (i32 argc, char **argv)
   s.pan_y = 0.0L;
   s.scale = 1.0L;
 
+  render_pan_x = 0.0L;
+  render_pan_y = 0.0L;
+  render_scale = 1.0L;
+
   s.redraw = true;
 
   atomic_init (&s.generation, 0);
@@ -2896,6 +2915,10 @@ main (i32 argc, char **argv)
                 s.pan_y = 0.0;
                 s.scale = 1.0;
 
+                render_pan_x = 0.0;
+                render_pan_y = 0.0;
+                render_scale = 1.0;
+
                 s.redraw = true;
                 break;
 
@@ -2912,6 +2935,8 @@ main (i32 argc, char **argv)
 
                   s.pan_x += mx / s.scale;
                   s.pan_y += my / s.scale;
+                  render_pan_x += mx / render_scale;
+                  render_pan_y += my / render_scale;
                 }
 
                 s.redraw = true;
@@ -3122,6 +3147,8 @@ main (i32 argc, char **argv)
               {
                 s.pan_x -= event.motion.xrel / s.scale;
                 s.pan_y -= event.motion.yrel / s.scale;
+                render_pan_x -= event.motion.xrel / render_scale;
+                render_pan_y -= event.motion.yrel / render_scale;
               }
             break;
 
@@ -3228,10 +3255,17 @@ main (i32 argc, char **argv)
               const f64 world_x = (anchor_x / s.scale) + s.pan_x;
               const f64 world_y = (anchor_y / s.scale) + s.pan_y;
 
+              const f64 rworld_x = (anchor_x / render_scale) + render_pan_x;
+              const f64 rworld_y = (anchor_y / render_scale) + render_pan_y;
+
               s.scale *= zoom;
+              render_scale *= zoom;
 
               s.pan_x = world_x - (anchor_x / s.scale);
               s.pan_y = world_y - (anchor_y / s.scale);
+
+              render_pan_x = rworld_x - (anchor_x / render_scale);
+              render_pan_y = rworld_y - (anchor_y / render_scale);
             }
 
             s.redraw = true;
@@ -3258,9 +3292,18 @@ main (i32 argc, char **argv)
 
           const f64 world_x = (sx / s.scale) + s.pan_x;
           const f64 world_y = (sy / s.scale) + s.pan_y;
+
+          const f64 rworld_x = (sx / render_scale) + render_pan_x;
+          const f64 rworld_y = (sy / render_scale) + render_pan_y;
+
           s.scale *= zoom;
+          render_scale *= zoom;
+
           s.pan_x = world_x - (sx / s.scale);
           s.pan_y = world_y - (sy / s.scale);
+
+          render_pan_x = rworld_x - (sx / render_scale);
+          render_pan_y = rworld_y - (sy / render_scale);
 
           // Refresh the underlying render periodically, but never while the
           // background GPU job is in flight: terminating then would block on
@@ -3297,11 +3340,12 @@ main (i32 argc, char **argv)
           // plus the uncommitted pan).  s.center_re is only a double snapshot
           // and quantises the zoom target once the view is deeper than an ulp.
           mpfr_add_d (eff_re, s.scene->c_re,
-                      s.pan_x * s.scene->width / (f64) s.w, MPFR_RNDN);
+                      render_pan_x * s.scene->width / (f64) s.w, MPFR_RNDN);
           mpfr_sub_d (eff_im, s.scene->c_im,
-                      s.pan_y * s.scene->width / (f64) s.w, MPFR_RNDN);
+                      render_pan_y * s.scene->width / (f64) s.w, MPFR_RNDN);
 
-          const f64 width = s.scene->width / (s.scale == 0.0 ? 1.0 : s.scale);
+          const f64 width = s.scene->width
+                            / (render_scale == 0.0 ? 1.0 : render_scale);
 
           // A view is a duplicate only when it moved by less than a
           // thousandth of a pixel.  The old fixed 1e-12 tolerance was
@@ -3452,6 +3496,10 @@ main (i32 argc, char **argv)
               s.pan_y = 0.0;
               s.scale = 1.0;
 
+              render_pan_x = 0.0;
+              render_pan_y = 0.0;
+              render_scale = 1.0;
+
               s.center_re = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
               s.center_im = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
 
@@ -3488,14 +3536,18 @@ main (i32 argc, char **argv)
 
               SDL_RenderCopyF (s.renderer, s.texture_helper, NULL, &vr);
 
-              mpfr_add_d (s.scene->c_re, s.scene->c_re, s.pan_x * s.scene->width / s.w, MPFR_RNDN);
-              mpfr_sub_d (s.scene->c_im, s.scene->c_im, s.pan_y * s.scene->width / s.w, MPFR_RNDN);
+              // Bake only the render transform: the displayed image keeps its
+              // own transform until the freshly rendered frame replaces it.
+              mpfr_add_d (s.scene->c_re, s.scene->c_re,
+                          render_pan_x * s.scene->width / s.w, MPFR_RNDN);
+              mpfr_sub_d (s.scene->c_im, s.scene->c_im,
+                          render_pan_y * s.scene->width / s.w, MPFR_RNDN);
 
-              s.scene->width /= s.scale;
+              s.scene->width /= render_scale;
 
-              s.pan_x = 0.0L;
-              s.pan_y = 0.0L;
-              s.scale = 1.0L;
+              render_pan_x = 0.0L;
+              render_pan_y = 0.0L;
+              render_scale = 1.0L;
 
               {
                 i32 mx, my;
@@ -3798,6 +3850,13 @@ main (i32 argc, char **argv)
             {
               compute_image_total = SDL_GetTicks () - compute_image_start;
 
+              // The finished frame is based on the scene centre baked at the
+              // last commit.  Adopt the render transform so the new frame is
+              // displayed at exactly the same place as the old one was.
+              s.pan_x = render_pan_x;
+              s.pan_y = render_pan_y;
+              s.scale = render_scale;
+
               preview_submit_job ();
 
               const bool can_probe = auto_iter
@@ -3928,23 +3987,34 @@ main (i32 argc, char **argv)
         {
           struct image *shown = preview_display_image (vibe);
 
-          // Upload texture (atomic per-pixel read, safe for partial frames).
-          {
-            i32 pitch;
-            void *pixels;
+          // In preview the displayed pixels only change when a new render or
+          // neural result arrives; re-uploading the same full-screen texture
+          // on every 60 Hz tick wasted enough CPU to stutter the zoom.
+          static u32 last_upload_gen = 0;
 
-            SDL_LockTexture (s.texture, NULL, &pixels, &pitch);
+          const bool unchanged =
+            preview_active () && shown == preview_fast_image
+            && last_upload_gen == preview_upload_gen;
 
-            for (i32 y = 0; y < shown->h; ++y)
-              {
-                u32 *row = (u32 *)((u8 *)pixels + (usize)y * (usize)pitch);
+          if (!unchanged)
+            {
+              i32 pitch;
+              void *pixels;
 
-                for (i32 x = 0; x < shown->w; ++x)
-                  row[x] = image_get2 (shown, x, y);
-              }
+              SDL_LockTexture (s.texture, NULL, &pixels, &pitch);
 
-            SDL_UnlockTexture (s.texture);
-          }
+              for (i32 y = 0; y < shown->h; ++y)
+                {
+                  u32 *row = (u32 *)((u8 *)pixels + (usize)y * (usize)pitch);
+
+                  for (i32 x = 0; x < shown->w; ++x)
+                    row[x] = image_get2 (shown, x, y);
+                }
+
+              SDL_UnlockTexture (s.texture);
+            }
+
+          last_upload_gen = preview_upload_gen;
 
           SDL_SetRenderTarget (s.renderer, s.texture_canvas);
           SDL_RenderCopy (s.renderer, s.texture, NULL, NULL);

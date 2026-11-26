@@ -27,6 +27,10 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - The display thread only presents the last complete texture; orbit and GPU/CPU rendering run outside it.
 - A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
 - Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
+- Two view transforms are kept: `s.pan/scale` for the displayed frame and
+  `render_pan/scale` for the frame being computed. Committing bakes only the
+  render transform, so the visible frame never snaps back while its successor
+  is still rendering; the display transform is adopted when a frame completes.
 - `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
 - `orbit_ready` stays true after a render, so queueing `compute_orbit` must
   clear it first; otherwise the next tick starts render workers while
@@ -75,6 +79,8 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   upscaled (`preview_render_gen`) immediately and the display's pan/scale
   transform zooms it smoothly between frames. `preview_active()` is false
   while recording/video rendering.
+  Preview texture uploads are skipped when the displayed pixels did not change
+  (`preview_upload_gen`), removing a full-screen 60 Hz copy.
 - `--fullscreen` sizes the window to the desktop display mode (useful with
   `--preview` so the half-res render still has detail).
 - Never use preview output as final output: it invents detail.
