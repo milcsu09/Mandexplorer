@@ -234,6 +234,30 @@ static f64 period_tol = 1e-40;
 // Vibe zoom factor per display tick.  Lower values make preview smoother at
 // the cost of zoom speed (the half-res frame is replaced ~10 times/s).
 static f64 vibe_step = 1.02;
+// Zoom anchor captured when vibe starts.  Following the live mouse position
+// makes the camera shake on remote desktops where the pointer never rests.
+static f64 vibe_anchor_x = 0.0;
+static f64 vibe_anchor_y = 0.0;
+
+static void
+vibe_set_anchor (void)
+{
+  i32 mx, my;
+  SDL_GetMouseState (&mx, &my);
+
+  if (mx < 0 || mx >= s.w || my < 0 || my >= s.h)
+    {
+      // Pointer outside the window: zoom into the centre instead of letting
+      // out-of-range coordinates drag the camera away.
+      vibe_anchor_x = 0.0;
+      vibe_anchor_y = 0.0;
+    }
+  else
+    {
+      vibe_anchor_x = (f64) mx - (f64) s.w / 2.0;
+      vibe_anchor_y = (f64) my - (f64) s.h / 2.0;
+    }
+}
 
 // At deep zoom a minibrot interior is normally pure black, which looks like
 // an unrendered hole.  Paint it dark blue so the small Mandelbrot silhouette
@@ -2878,6 +2902,7 @@ main (i32 argc, char **argv)
 
                 if (vibe)
                   {
+                    vibe_set_anchor ();
                     // Disable SSAA in vibe mode for speed.
                     s.ss_prev = s.ss;
                     s.ss = 1;
@@ -3100,6 +3125,7 @@ main (i32 argc, char **argv)
 
                     // Vibe zoom gives a smooth trajectory while recording.
                     vibe = true;
+                    vibe_set_anchor ();
 
                     printf ("Recording started\n");
                   }
@@ -3316,10 +3342,8 @@ main (i32 argc, char **argv)
           static u64 vibe_counter = 0;
           vibe_counter++;
 
-          i32 mx, my;
-          SDL_GetMouseState (&mx, &my);
-          const f64 sx = mx - s.w / 2.0;
-          const f64 sy = my - s.h / 2.0;
+          const f64 sx = vibe_anchor_x;
+          const f64 sy = vibe_anchor_y;
 
           const f64 zoom = vibe_step;
 

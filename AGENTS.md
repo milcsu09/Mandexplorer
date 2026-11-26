@@ -29,6 +29,9 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Zoom defaults to 1.02 per frame (`--vibe-step <float>` overrides it; lower =
   smoother preview, slower zoom). Final quality (`iter_max`/SSAA/resolution)
   is unchanged.
+- The zoom anchor is captured when vibe starts (`vibe_set_anchor()`); the live
+  mouse position is not followed, so pointer jitter on remote desktops cannot
+  shake the camera. Pointer outside the window means zoom into the centre.
 - The view shown by the current frame is kept in MPFR (`disp_base_*`), as is
   the view its successor is rendered from (`render_base_*`). The scene is
   rebased at render start, and pan/scale are recomputed from the exact views
