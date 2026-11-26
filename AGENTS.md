@@ -28,6 +28,9 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
 - Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
 - `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
+- `orbit_ready` stays true after a render, so queueing `compute_orbit` must
+  clear it first; otherwise the next tick starts render workers while
+  `compute_orbit` rebuilds `bla_table` (use-after-free in `bla_try_skip`).
 
 ## BLA acceleration
 - `src/bla.c`/`bla.h`: second-order bilinear approximation of the reference
@@ -54,6 +57,8 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   warps oscillate. `view_offset_px()` also works from the exact centres, and
   `MANDEX_DUMP_VIEWS=1` dumps all recorded centres to
   `/tmp/mandexplorer_views.txt` when rendering starts.
+- Preview is suspended for the whole recording/video render: frames are
+  rendered at full `s.w x s.h` into `s.image`, never through FSRCNN.
 
 ## Neural preview
 - `--preview`: fractal is computed into `preview_render_image` at half of
@@ -64,6 +69,10 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Display never blocks: `preview_display_image()` shows a live bilinear upscale
   of the half-res buffer until the worker publishes the neural result.
   At most one upscale job is in flight; newest completed frame wins.
+  After the first neural result the last complete frame stays on screen until
+  the next one arrives (no flicker back to the partial bilinear image), and
+  the half-res buffer is cleared at every commit so vibe frames do not leave
+  stale pixels. `preview_active()` is false while recording/video rendering.
 - `--fullscreen` sizes the window to the desktop display mode (useful with
   `--preview` so the half-res render still has detail).
 - Never use preview output as final output: it invents detail.
