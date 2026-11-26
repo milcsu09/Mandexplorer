@@ -27,6 +27,11 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - The display thread only presents the last complete texture; orbit and GPU/CPU rendering run outside it.
 - A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
 - Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
+- `bake_view()` rebases the scene **and** resamples the displayed image
+  (`bake_display()`, ported from `mandexplorer.goose`) together when a render
+  is dispatched. Vibe no longer has a fixed 15-tick cooldown: a fresh render
+  is dispatched on drift (1.02 idle / 5.0 in flight), and magnifying a stale
+  frame is paused above 1.2x while rendering.
 - `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
 - `orbit_ready` stays true after a render, so queueing `compute_orbit` must
   clear it first; otherwise the next tick starts render workers while
@@ -66,8 +71,9 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   `tools/nn_preview.py` (FSRCNN x2, `models/FSRCNN_x2.onnx`) into `s.image`.
 - `s.image` stays full-size for the texture, video and UI; the GPU path is
   disabled in preview mode while BLA still accelerates the half-res render.
-- Display never blocks: `preview_display_image()` shows a live bilinear upscale
-  of the half-res buffer until the worker publishes the neural result.
+- There is a **single display buffer** (`s.image`): a completed half-res render
+  is copied in bilinearly immediately, FSRCNN may replace it later; during vibe
+  only the live stream is used so sharp/soft flips cannot happen.
   At most one upscale job is in flight; newest completed frame wins.
   After the first neural result the last complete frame stays on screen until
   the next one arrives (no flicker back to the partial bilinear image), and
