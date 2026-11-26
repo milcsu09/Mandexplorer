@@ -51,6 +51,29 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   a view width (`ORBIT_REUSE_DEEP_EPS`) and BLA is rebuilt for the new delta;
   final renders keep the strict check so they stay pixel-identical.
 
+## Checkpointed orbit (stage 1 of the deep-zoom port)
+- `src/orbit.c`/`orbit.h` replace the two `f64[N+1]` arrays. Exact MPFR `z`
+  is stored every `ORBIT_STRIDE` (4096) iterations; doubles are regenerated on
+  demand by a per-thread window using the **same MPFR ops and precision**, so
+  every orbit value is bit-identical to the old representation.
+- Scenes with `N <= ~19M` also get an f64 mirror filled during the same MPFR
+  pass (zero extra cost), keeping old speed and the GPU path. Larger scenes
+  use checkpoints only; memory is ~64 bytes per 4096 iterations instead of
+  16 bytes per iteration (2^25 renders at ~155 MB RSS instead of ~690 MB).
+- If the flat mirror is absent the GPU is disabled (its kernel indexes an
+  arbitrary orbit position). The flat buffers are reused across regenerations
+  so an in-flight async GPU job never reads freed memory.
+- `MANDEX_ORBIT_FLAT=0` forces checkpoint-only mode at any N;
+  `MANDEX_ORBIT_STRIDE=N` overrides the checkpoint interval (32..1M).
+- Pixel-identity regression (`--reverse-video` + `MANDEX_DUMP`, 64x48,
+  `palettes/big.pal`): default.sce `3759b222515d7334179e8d76fbb53266`,
+  deep scene `20261126_071203.sce` `96ac31aeb421f2737a2289edd38d19e3`,
+  mid-deep `20261126_002836.sce` `63d350482e6c3d1ba52689a0ef075154`
+  (the last two also pass with `MANDEX_ORBIT_FLAT=0`).
+- This stage removes the memory wall but NOT the O(N) time wall: generating
+  checkpoints still walks every iteration, so 10^16 needs stages 3-4
+  (rebase + MPA skips) as well.
+
 ## Iteration ceiling
 - `MAX_ITER_MAX` is **33554432** (2^25, was 2^24). It is a hard clamp in
   `apply_iter_max()`, the adaptive controller and the reverse-video generator;

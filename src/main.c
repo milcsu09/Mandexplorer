@@ -15,6 +15,7 @@
 #include "common.h"
 #include "config.h"
 #include "image.h"
+#include "orbit.h"
 #include "palette.h"
 #include "scene.h"
 #include "thread_pool.h"
@@ -130,9 +131,6 @@ static struct
 
   struct image *image;
 
-  f64 *orbit_re;
-  f64 *orbit_im;
-
   i32 ss;
   i32 ss_prev;
 
@@ -240,6 +238,7 @@ struct orbit_cache
 };
 
 static struct orbit_cache orbit_cache;
+static struct orbit reference_orbit;
 static struct bla_table bla_table;
 
 // Neural preview: render at half resolution, upscale with FSRCNN for display.
@@ -275,6 +274,11 @@ static f64 bla_margin = 16.0;
 static bool bla_enabled = true;
 static f64 delta_c_re = 0.0;
 static f64 delta_c_im = 0.0;
+
+// Stage-1 toggle: MANDEX_ORBIT_FLAT=0 forces the checkpoint-only path even for
+// small scenes, which is how pixel identity of regeneration is regression
+// tested against the old full-array renderer.
+static bool orbit_flat_allowed = true;
 
 static struct image *keyframe_image = NULL;
 static struct view_state keyframe_view;
@@ -1304,27 +1308,9 @@ apply_iter_max (u64 iter_max)
   orbit_cache.valid = false;
   bla_table.valid = false;
 
-  f64 *orbit_re = calloc (iter_max + 1, sizeof (f64));
-  f64 *orbit_im = calloc (iter_max + 1, sizeof (f64));
-
-  if (!orbit_re || !orbit_im)
-    {
-      free (orbit_re);
-      free (orbit_im);
-
-      fprintf (stderr, "Could not allocate orbit buffers for %lu iterations\n",
-               (unsigned long)iter_max);
-
-      return false;
-    }
-
   terminate ();
 
-  free (s.orbit_re);
-  free (s.orbit_im);
-
-  s.orbit_re = orbit_re;
-  s.orbit_im = orbit_im;
+  orbit_invalidate (&reference_orbit);
 
   s.scene->iter_max = iter_max;
 
@@ -1355,6 +1341,14 @@ orbit_precision (void)
 }
 
 
+static bool
+orbit_cancelled (void *argument)
+{
+  (void)argument;
+  return s.work_generation != atomic_load (&s.generation);
+}
+
+
 void
 compute_orbit (void *argument)
 {
@@ -1370,42 +1364,23 @@ compute_orbit (void *argument)
       return;
     }
 
-  mpfr_t two, z_re, z_im, z_re_new, t;
+  if (orbit_cancelled (NULL))
+    return;
 
-  mpfr_inits2 (orbit_precision (), two, z_re, z_im, z_re_new, t, (mpfr_ptr)NULL);
-
-  mpfr_set_d (two, 2.0, MPFR_RNDN);
-  mpfr_set_d (z_re, 0.0, MPFR_RNDN);
-  mpfr_set_d (z_im, 0.0, MPFR_RNDN);
-
-  for (u64 iter = 0; iter <= s.scene->iter_max; iter++)
+  if (!orbit_generate (&reference_orbit, s.scene->iter_max,
+                       s.scene->c_re, s.scene->c_im, orbit_precision (),
+                       orbit_flat_allowed, orbit_cancelled, NULL))
     {
-      if (s.work_generation != atomic_load (&s.generation))
-        {
-          mpfr_clears (two, z_re, z_im, z_re_new, t, (mpfr_ptr)NULL);
-          return;
-        }
+      // A failed flat-mirror allocation must not stall the phase machine.
+      // Retry checkpoint-only; bail out only if the generation changed.
+      if (orbit_cancelled (NULL))
+        return;
 
-      s.orbit_re[iter] = mpfr_get_d (z_re, MPFR_RNDN);
-      s.orbit_im[iter] = mpfr_get_d (z_im, MPFR_RNDN);
-
-      // t = z_im * z_im
-      mpfr_sqr (t, z_im, MPFR_RNDN);
-
-      // z_re_new = z_re * z_re - t
-      mpfr_fms (z_re_new, z_re, z_re, t, MPFR_RNDN);
-
-      // t = z_re * z_im
-      mpfr_mul (t, z_re, z_im, MPFR_RNDN);
-
-      // z_im = t * 2 + c_im
-      mpfr_fma (z_im, t, two, s.scene->c_im, MPFR_RNDN);
-
-      // z_re = z_re_new + c_re
-      mpfr_add (z_re, z_re_new, s.scene->c_re, MPFR_RNDN);
+      if (!orbit_generate (&reference_orbit, s.scene->iter_max,
+                           s.scene->c_re, s.scene->c_im, orbit_precision (),
+                           false, orbit_cancelled, NULL))
+        return;
     }
-
-  mpfr_clears (two, z_re, z_im, z_re_new, t, (mpfr_ptr)NULL);
 
   mpfr_set (orbit_cache.c_re, s.scene->c_re, MPFR_RNDN);
   mpfr_set (orbit_cache.c_im, s.scene->c_im, MPFR_RNDN);
@@ -1419,7 +1394,7 @@ compute_orbit (void *argument)
   if (bla_enabled && s.scene->width <= 1e-12)
     {
       const f64 shift = hypot (delta_c_re, delta_c_im);
-      bla_build (&bla_table, s.orbit_re, s.orbit_im, s.scene->iter_max,
+      bla_build (&bla_table, &reference_orbit, s.scene->iter_max,
                  s.scene->width * 0.75 + shift, bla_margin);
     }
   else
@@ -2031,8 +2006,13 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
           iter += span;
           iter_orbit += span;
 
-          const f64 zr = s.orbit_re[iter_orbit] + epsilon_re;
-          const f64 zi = s.orbit_im[iter_orbit] + epsilon_im;
+          f64 rr, ri;
+
+          if (!orbit_at (&reference_orbit, iter_orbit, &rr, &ri))
+            return 0.0;
+
+          const f64 zr = rr + epsilon_re;
+          const f64 zi = ri + epsilon_im;
           const f64 z2 = zr * zr + zi * zi;
 
           if (z2 > bailout2)
@@ -2063,8 +2043,8 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
       f64 z_re;
       f64 z_im;
 
-      r_re = s.orbit_re[iter_orbit];
-      r_im = s.orbit_im[iter_orbit];
+      if (!orbit_at (&reference_orbit, iter_orbit, &r_re, &r_im))
+        return 0.0;
 
       z_re = r_re + epsilon_re;
       z_im = r_im + epsilon_im;
@@ -2088,8 +2068,8 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
       epsilon_re = lin_re + quad_re + delta_re;
       epsilon_im = lin_im + quad_im + delta_im;
 
-      r_re = s.orbit_re[iter_orbit + 1];
-      r_im = s.orbit_im[iter_orbit + 1];
+      if (!orbit_at (&reference_orbit, iter_orbit + 1, &r_re, &r_im))
+        return 0.0;
 
       z_re = r_re + epsilon_re;
       z_im = r_im + epsilon_im;
@@ -2439,6 +2419,9 @@ main (i32 argc, char **argv)
       if (v > 0)
         auto_frames = (usize) v;
     }
+
+  if (getenv ("MANDEX_ORBIT_FLAT") && strcmp (getenv ("MANDEX_ORBIT_FLAT"), "0") == 0)
+    orbit_flat_allowed = false;
 
   dump_prefix = getenv ("MANDEX_DUMP");
 
@@ -3006,8 +2989,7 @@ main (i32 argc, char **argv)
 
   keyframe_image = image_create (s.w, s.h);
 
-  s.orbit_re = calloc (s.scene->iter_max + 1, sizeof (f64));
-  s.orbit_im = calloc (s.scene->iter_max + 1, sizeof (f64));
+  orbit_init (&reference_orbit);
 
   s.ss = 1;
 
@@ -3913,7 +3895,7 @@ main (i32 argc, char **argv)
                   // The orbit is unchanged, but BLA's entry radius depends on
                   // both the delta and the current width.
                   if (vibe && bla_enabled && s.scene->width <= 1e-12)
-                    bla_build (&bla_table, s.orbit_re, s.orbit_im,
+                    bla_build (&bla_table, &reference_orbit,
                                s.scene->iter_max,
                                s.scene->width * 0.75
                                + hypot (delta_c_re, delta_c_im),
@@ -3959,6 +3941,7 @@ main (i32 argc, char **argv)
                 !vibe
                 && gpu_is_available ()
                 && !preview_mode
+                && orbit_has_flat (&reference_orbit)
                 && !(bla_enabled && s.scene->width <= 1e-12)
                 && gpu_should_use (s.w, s.h, s.render_ss, s.scene->iter_max,
                                    s.scene->width, s.formula, s.render_vibe);
@@ -4058,8 +4041,10 @@ main (i32 argc, char **argv)
                   gv.w = s.w;
                   gv.h = s.h;
                   gv.palette = s.palette;
-                  gv.orbit_re = s.orbit_re;
-                  gv.orbit_im = s.orbit_im;
+                  gv.orbit_re = orbit_has_flat (&reference_orbit)
+                                ? reference_orbit.flat_re : NULL;
+                  gv.orbit_im = orbit_has_flat (&reference_orbit)
+                                ? reference_orbit.flat_im : NULL;
                   gv.delta_c_re = delta_c_re;
                   gv.delta_c_im = delta_c_im;
                   gv.period_tol = period_tol;
@@ -4097,7 +4082,8 @@ main (i32 argc, char **argv)
               // In vibe mode, also kick off a background GPU render into a
               // separate buffer.  When it completes, its sharp result replaces
               // the partial CPU circle.
-              if (vibe && s.scene->iter_max <= 1000 && !gpu_vibe_inflight)
+              if (vibe && s.scene->iter_max <= 1000 && !gpu_vibe_inflight
+                  && orbit_has_flat (&reference_orbit))
                 {
                   struct gpu_view gv;
                   gv.c_re = s.center_re;
@@ -4116,8 +4102,10 @@ main (i32 argc, char **argv)
                   gv.w = s.w;
                   gv.h = s.h;
                   gv.palette = s.palette;
-                  gv.orbit_re = s.orbit_re;
-                  gv.orbit_im = s.orbit_im;
+                  gv.orbit_re = orbit_has_flat (&reference_orbit)
+                                ? reference_orbit.flat_re : NULL;
+                  gv.orbit_im = orbit_has_flat (&reference_orbit)
+                                ? reference_orbit.flat_im : NULL;
                   gv.delta_c_re = delta_c_re;
                   gv.delta_c_im = delta_c_im;
                   gv.period_tol = period_tol;
@@ -4461,6 +4449,7 @@ main (i32 argc, char **argv)
   terminate ();
 
   mpfr_clears (orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
+  orbit_clear (&reference_orbit);
 
   if (keyframe_image)
     image_destroy (keyframe_image);

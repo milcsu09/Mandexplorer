@@ -112,7 +112,7 @@ bla_clear (struct bla_table *t)
 }
 
 void
-bla_build (struct bla_table *t, const f64 *orbit_re, const f64 *orbit_im,
+bla_build (struct bla_table *t, struct orbit *orbit,
            u64 n, f64 max_delta, f64 margin)
 {
   bla_clear (t);
@@ -161,8 +161,16 @@ bla_build (struct bla_table *t, const f64 *orbit_re, const f64 *orbit_im,
 
       for (i32 k = 0; k < BLA_BASE_STEP; ++k)
         {
-          const f64 zx = 2.0 * orbit_re[start + k];
-          const f64 zy = 2.0 * orbit_im[start + k];
+          f64 rr, ri;
+
+          if (!orbit_at (orbit, (u64) start + (u64) k, &rr, &ri))
+            {
+              radius = BLA_NEVER;
+              break;
+            }
+
+          const f64 zx = 2.0 * rr;
+          const f64 zy = 2.0 * ri;
           const f64 mag = hypot (zx, zy);
 
           if (mag == 0.0)

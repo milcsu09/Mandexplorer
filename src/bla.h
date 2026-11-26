@@ -2,6 +2,7 @@
 #define BLA_H
 
 #include "common.h"
+#include "orbit.h"
 
 // Second-order bilinear approximation ("BLA") of a reference-orbit range.
 // A skip maps the travelling perturbation w and the pixel offset d by
@@ -26,7 +27,7 @@ struct bla_table
   bool valid;
 };
 
-void bla_build (struct bla_table *t, const f64 *orbit_re, const f64 *orbit_im,
+void bla_build (struct bla_table *t, struct orbit *orbit,
                 u64 n, f64 max_delta, f64 margin);
 void bla_clear (struct bla_table *t);
 
