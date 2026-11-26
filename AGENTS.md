@@ -27,6 +27,10 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - The display thread only presents the last complete texture; orbit and GPU/CPU rendering run outside it.
 - A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
 - Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
+- `bake_display()` (ported from `mandexplorer.goose`) resamples the image that
+  is actually shown with the pending transform at every rebase, so the CPU
+  pixels and the SDL canvas agree with the rebased scene. Sampling coords
+  match the SDL `vr` transform (no Goose half-pixel offset).
 - `canvas_frozen` is set when the SDL texture transform is baked into
   `texture_canvas` at a rebase and cleared when the next full frame is ready.
   While frozen the stale `s.image` is **not** uploaded (otherwise it overwrites

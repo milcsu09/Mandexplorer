@@ -1039,6 +1039,50 @@ preview_display_image (void)
 }
 
 
+// Goose bake_display(): resample the image that is actually on screen with
+// the pending display transform, then reset the transform to identity.  Scene
+// and pixels are rebased together, so a new render cannot snap the view back.
+// The sampling coordinates match the SDL vr transform used by the display.
+static void
+bake_display (void)
+{
+  if (s.scale == 1.0 && s.pan_x == 0.0 && s.pan_y == 0.0)
+    return;
+
+  struct image *shown = s.image;
+
+  // In vibe the preview presents the live bilinear buffer, not s.image.
+  if (vibe && preview_active () && preview_div > 1 && preview_fast_image)
+    shown = preview_fast_image;
+
+  if (!shown)
+    return;
+
+  struct image *tmp = image_create (shown->w, shown->h);
+
+  if (!tmp)
+    return;
+
+  const f64 inv = 1.0 / s.scale;
+  const f64 cx = (f64) shown->w * 0.5;
+  const f64 cy = (f64) shown->h * 0.5;
+
+  for (i32 y = 0; y < shown->h; ++y)
+    {
+      const f64 vy = ((f64) y + 0.5 - cy) * inv + cy + s.pan_y;
+
+      for (i32 x = 0; x < shown->w; ++x)
+        {
+          const f64 vx = ((f64) x + 0.5 - cx) * inv + cx + s.pan_x;
+          image_set2 (tmp, x, y, bilinear_sample (shown, vx, vy));
+        }
+    }
+
+  image_copy (shown, tmp);
+  image_destroy (tmp);
+}
+
+
 i32
 n_tiles (void)
 {
@@ -3465,6 +3509,10 @@ main (i32 argc, char **argv)
           if (s.redraw)
             {
               s.redraw = false;
+
+              // Bake the display transform into the visible pixels as well
+              // as the SDL canvas; both now agree with the rebased scene.
+              bake_display ();
 
               SDL_SetRenderTarget (s.renderer, s.texture_helper);
               SDL_RenderClear (s.renderer);
