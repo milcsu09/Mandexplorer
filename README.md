@@ -28,6 +28,29 @@ OR
 
 Press `F1` inside the running program for overlay help.
 
+## Reverse video (offline zoom)
+
+No real-time capture needed: zoom to the target view, save it (`s`), and let
+the renderer generate the whole MP4 from two scenes:
+
+```bash
+# zoom out from the saved deep scene to default.sce
+./a default.sce --reverse-video target.sce --dir out --frames 900
+
+# zoom in from default.sce to the saved deep scene
+./a default.sce --reverse-video target.sce --dir in
+
+# continue from a scene saved mid-zoom
+./a saved_mid.sce --from saved_mid.sce --reverse-video target.sce --dir in
+```
+
+`--from` defaults to `default.sce`, `--dir` to `out`, `--frames` to 900 (30 s
+at 30 fps). Shift+R does the same using the **current view** as the target and
+`--from` (or `default.sce`) as the start. The generated trajectory keeps the
+target point anchored on screen; iteration count grows with log-depth (17M
+only on the deepest frames) and a probe raises it if pixels are still moving.
+Frames are rendered full-size with SSAA=2, same as recorded video.
+
 ## Deep zoom acceleration (BLA)
 
 For `width <= 1e-12` the renderer automatically enables a second-order

@@ -79,6 +79,16 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Preview is suspended for the whole recording/video render: frames are
   rendered at full `s.w x s.h` into `s.image`, never through FSRCNN.
 
+## Reverse video
+- `Shift+R` or `--reverse-video TARGET.sce` generates the zoom trajectory
+  offline from `--from START.sce` (default `default.sce`) to TARGET (or the
+  current view for the key). `--dir in|out` (default out), `--frames N`
+  (default 900). No real-time recording; CLI mode exits after the MP4.
+- The centre is interpolated in MPFR with the target point anchored:
+  `c(t) = c_target - (c_target - c_start) * w(t)/w_start`, width geometric.
+- Per-frame `iter_max` follows log-depth (deep frames only get the full N),
+  with a bounded probe raising it if pixels are still changing.
+
 ## Neural preview
 - `--preview`: fractal is computed into `preview_render_image` at half of
   `s.w x s.h`, then a dedicated worker thread pipes it through

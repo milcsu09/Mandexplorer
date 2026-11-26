@@ -611,6 +611,146 @@ fit_video_n (struct view_state *v)
 }
 
 
+// Deterministic zoom between two saved scenes.  Shift+R uses the current view
+// as the target; --reverse-video loads one from disk.  The generated views go
+// through the same full-resolution video pipeline as recorded views.
+static void
+generate_reverse_views (const char *start_path, const struct scene *target,
+                        bool dir_out, usize frames)
+{
+  const char *path = start_path ? start_path : "default.sce";
+  struct scene *start = scene_load (path);
+
+  if (!start)
+    {
+      fprintf (stderr, "Error: Failed to load start scene (%s)\n", path);
+      return;
+    }
+
+  if (frames < 2)
+    frames = 2;
+  if (frames > 65536)
+    frames = 65536;
+
+  recorded_views_free ();
+  recorded_cap = frames;
+  recorded_views = calloc (frames, sizeof *recorded_views);
+
+  if (!recorded_views)
+    {
+      fprintf (stderr, "Error: Cannot allocate %zu video views\n", frames);
+      scene_destroy (start);
+      return;
+    }
+
+  mpfr_t d_re, d_im, cr, ci, t;
+  mpfr_inits2 (FLOAT_PREC, d_re, d_im, cr, ci, t, (mpfr_ptr) NULL);
+  mpfr_sub (d_re, target->c_re, start->c_re, MPFR_RNDN);
+  mpfr_sub (d_im, target->c_im, start->c_im, MPFR_RNDN);
+
+  const f64 w0 = start->width;
+  const f64 w1 = target->width;
+  const f64 w_shallow = fmax (w0, w1);
+  const f64 w_deep = fmin (w0, w1);
+  const f64 depth_max = (w_deep > 0.0 && w_shallow > w_deep)
+                        ? log2 (w_shallow / w_deep) : 0.0;
+
+  const u64 n_deep = fmax (start->iter_max, target->iter_max);
+  const u64 n_floor = fmax ((u64) 4096, target->iter_per_color * 16);
+  const u64 n_deep_c = fmax (n_deep, n_floor);
+
+  s.work_generation = atomic_load (&s.generation);
+
+  for (usize i = 0; i < frames; ++i)
+    {
+      const f64 u = (f64) i / (f64) (frames - 1);
+      const f64 tv = dir_out ? 1.0 - u : u;   // 0 = start, 1 = target
+
+      const f64 w = w0 * pow (w1 / w0, tv);
+      const f64 scale = w / w0;              // keeps the target anchored
+
+      mpfr_mul_d (t, d_re, scale, MPFR_RNDN);
+      mpfr_sub (cr, target->c_re, t, MPFR_RNDN);
+      mpfr_mul_d (t, d_im, scale, MPFR_RNDN);
+      mpfr_sub (ci, target->c_im, t, MPFR_RNDN);
+
+      struct view_state *v = &recorded_views[recorded_count++];
+      view_state_init (v);
+      view_state_set_center (v, cr, ci);
+      v->width = w;
+
+      // Iterations grow with log-depth: 17M only where the view is deep.
+      f64 frac = depth_max > 0.0
+                 ? log2 (w_shallow / w) / depth_max : 1.0;
+      if (frac < 0.0) frac = 0.0;
+      if (frac > 1.0) frac = 1.0;
+
+      u64 n = (u64) ((f64) n_floor
+                     * pow ((f64) n_deep_c / (f64) n_floor, frac));
+      if (n < n_floor) n = n_floor;
+      if (n > MAX_ITER_MAX) n = MAX_ITER_MAX;
+
+      // Safety net: raise the schedule if pixels still move at that N.
+      const u64 saved_deadline = probe_deadline_ms;
+      const u64 saved_min_samples = probe_min_samples;
+      probe_deadline_ms = 1000;
+      probe_min_samples = VIDEO_FIT_PROBE_MIN_SAMP;
+      probe_iter_per_color = target->iter_per_color;
+      probe_center_re = v->c_re;
+      probe_center_im = v->c_im;
+      probe_width = w;
+      probe_bailout2 = target->bailout * target->bailout;
+      probe_omni_a = s.omni_a;
+      probe_screen_w = s.w;
+      probe_screen_h = s.h;
+      probe_formula = s.formula;
+
+      for (int attempt = 0; attempt < 3 && n < n_deep_c; ++attempt)
+        {
+          probe_iter = n;
+          probe_changed = 0;
+          probe_total = 0;
+          atomic_store (&probe_done, false);
+          probe_job (NULL);
+
+          if (probe_total < probe_min_samples) break;
+          if ((f64) probe_changed / (f64) probe_total
+              < VIDEO_FIT_SENS_LO) break;
+
+          n = fmin ((u64) MAX_ITER_MAX, n * 2);
+        }
+
+      probe_deadline_ms = saved_deadline;
+      probe_min_samples = saved_min_samples;
+
+      v->iter_max = n;
+      v->recorded_iter_max = n;
+      v->iter_per_color = target->iter_per_color;
+      v->ss = 2;
+      v->formula = s.formula;
+      v->omni_a = s.omni_a;
+      v->bailout = target->bailout;
+      v->lx = target->lx;
+      v->ly = target->ly;
+      v->lz = target->lz;
+      v->color_inside = color_inside;
+    }
+
+  mpfr_clears (d_re, d_im, cr, ci, t, (mpfr_ptr) NULL);
+  scene_destroy (start);
+
+  printf ("Generated %zu reverse views (%s): width %.3e -> %.3e, "
+          "iterations %lu -> %lu\n",
+          recorded_count, dir_out ? "zoom out" : "zoom in",
+          recorded_views[0].width,
+          recorded_views[recorded_count - 1].width,
+          (unsigned long) recorded_views[0].iter_max,
+          (unsigned long) recorded_views[recorded_count - 1].iter_max);
+
+  start_render_phase ();
+}
+
+
 static bool
 can_reuse_keyframe (const struct view_state *kv, const struct view_state *v)
 {
@@ -2210,6 +2350,10 @@ help (FILE *f, const char *self)
   fprintf (f, "  --fullscreen                   Use the desktop resolution as the window size\n");
   fprintf (f, "  --preview-div  <int>          Preview render divisor: 1 full, 2 + FSRCNN (default 2)\n");
   fprintf (f, "  --gpu-info                     Print GPU info and exit\n");
+  fprintf (f, "  --reverse-video <SCENE>        Render a zoom to/from SCENE (Shift+R uses current view)\n");
+  fprintf (f, "  --from         <SCENE>         Start scene (default: default.sce)\n");
+  fprintf (f, "  --dir          <in|out>        Zoom direction (default: out)\n");
+  fprintf (f, "  --frames       <int>           Number of video frames (default: 900)\n");
   fprintf (f, "\n");
   fprintf (f, "SCENE:\n");
   fprintf (f, "  A '*.sce' file\n");
@@ -2248,6 +2392,11 @@ main (i32 argc, char **argv)
   bool gpu_info = false;
 
   const char *scene_path = NULL;
+
+  const char *reverse_target_path = NULL;
+  const char *reverse_start_path = NULL;
+  bool reverse_dir_out = true;
+  usize reverse_frames = 900;
 
   const char *c_re = NULL;
   const char *c_im = NULL;
@@ -2590,6 +2739,67 @@ main (i32 argc, char **argv)
           continue;
         }
 
+      if (strcmp (arg, "--reverse-video") == 0)
+        {
+          if (i + 1 >= argc)
+            {
+              fprintf (stderr, "Error: '--reverse-video' requires a scene path\n");
+              return 1;
+            }
+          reverse_target_path = argv[++i];
+          ++i;
+          continue;
+        }
+
+      if (strcmp (arg, "--from") == 0)
+        {
+          if (i + 1 >= argc)
+            {
+              fprintf (stderr, "Error: '--from' requires a scene path\n");
+              return 1;
+            }
+          reverse_start_path = argv[++i];
+          ++i;
+          continue;
+        }
+
+      if (strcmp (arg, "--dir") == 0)
+        {
+          if (i + 1 >= argc)
+            {
+              fprintf (stderr, "Error: '--dir' requires 'in' or 'out'\n");
+              return 1;
+            }
+          const char *d = argv[++i];
+          if (strcmp (d, "in") == 0)
+            reverse_dir_out = false;
+          else if (strcmp (d, "out") != 0)
+            {
+              fprintf (stderr, "Error: '--dir' must be 'in' or 'out'\n");
+              return 1;
+            }
+          ++i;
+          continue;
+        }
+
+      if (strcmp (arg, "--frames") == 0)
+        {
+          if (i + 1 >= argc)
+            {
+              fprintf (stderr, "Error: '--frames' requires an integer\n");
+              return 1;
+            }
+          const long v = strtol (argv[++i], NULL, 10);
+          if (v < 2 || v > 65536)
+            {
+              fprintf (stderr, "Error: '--frames' must be 2..65536\n");
+              return 1;
+            }
+          reverse_frames = (usize) v;
+          ++i;
+          continue;
+        }
+
       if (scene_path)
         {
           fprintf (stderr, "Error: Scene path already specified (%s)\n", scene_path);
@@ -2613,6 +2823,9 @@ main (i32 argc, char **argv)
 
       return 0;
     }
+
+  if (scene_path == NULL && reverse_target_path)
+    scene_path = reverse_start_path ? reverse_start_path : "default.sce";
 
   if (scene_path == NULL)
     {
@@ -2846,6 +3059,22 @@ main (i32 argc, char **argv)
 
           start_render_phase ();
         }
+    }
+
+  if (reverse_target_path)
+    {
+      struct scene *target = scene_load (reverse_target_path);
+
+      if (!target)
+        {
+          fprintf (stderr, "Error: Failed to load reverse target (%s)\n",
+                   reverse_target_path);
+          return 1;
+        }
+
+      generate_reverse_views (reverse_start_path, target,
+                              reverse_dir_out, reverse_frames);
+      scene_destroy (target);
     }
 
   struct work *works = calloc (n_tiles (), sizeof (struct work));
@@ -3090,6 +3319,16 @@ main (i32 argc, char **argv)
               case SDLK_r:
                 if (rendering_video)
                   break;
+
+                if (SDL_GetModState () & KMOD_SHIFT)
+                  {
+                    if (recording)
+                      break;
+
+                    generate_reverse_views (reverse_start_path, s.scene,
+                                            reverse_dir_out, reverse_frames);
+                    break;
+                  }
 
                 if (!recording)
                   {
@@ -4006,7 +4245,7 @@ main (i32 argc, char **argv)
               printf ("Recording render finished: %zu frames -> '%s'\n",
                       recorded_count, video_path);
 
-              if (auto_frames > 0)
+              if (auto_frames > 0 || reverse_target_path)
                 s.running = false;
             }
         }
