@@ -16,6 +16,7 @@
 #include "config.h"
 #include "image.h"
 #include "orbit.h"
+#include "pa.h"
 #include "palette.h"
 #include "scene.h"
 #include "thread_pool.h"
@@ -240,6 +241,7 @@ struct orbit_cache
 static struct orbit_cache orbit_cache;
 static struct orbit reference_orbit;
 static struct bla_table bla_table;
+static struct pa_table pa_table;
 
 // Neural preview: render at half resolution, upscale with FSRCNN for display.
 // s.image stays full-size (UI, video, texture); preview_render_image is the
@@ -279,6 +281,11 @@ static f64 delta_c_im = 0.0;
 // small scenes, which is how pixel identity of regeneration is regression
 // tested against the old full-array renderer.
 static bool orbit_flat_allowed = true;
+
+// Stage 3: first-order PA skips.  Opt-in until pixel identity is confirmed.
+static bool pa_enabled = false;
+static f64 pa_epsilon = 9.313225746154785e-10; // 2^-30
+static _Atomic u64 pa_skips_applied;
 
 static struct image *keyframe_image = NULL;
 static struct view_state keyframe_view;
@@ -1311,6 +1318,7 @@ apply_iter_max (u64 iter_max)
   terminate ();
 
   orbit_invalidate (&reference_orbit);
+  pa_clear (&pa_table);
 
   s.scene->iter_max = iter_max;
 
@@ -1381,6 +1389,35 @@ compute_orbit (void *argument)
                            s.scene->width, false, orbit_cancelled, NULL))
         return;
     }
+
+  if (pa_enabled)
+    {
+      if (!pa_build (&pa_table, &reference_orbit, s.scene->width, pa_epsilon))
+        pa_clear (&pa_table);
+      else if (getenv ("MANDEX_PA_STATS"))
+        {
+          f64 min_radius = INFINITY;
+          u64 max_skip = 0;
+
+          for (usize i = 0; i < pa_table.count; ++i)
+            {
+              min_radius = fmin (min_radius, pa_table.entries[i].radius);
+              max_skip = imax ((i64) max_skip,
+                               (i64) pa_table.entries[i].skip);
+            }
+
+          fprintf (stderr, "PA: %zu entries, max skip %llu, min radius %.1f\n",
+                   pa_table.count, (unsigned long long) max_skip, min_radius);
+
+          for (usize i = 0; i < pa_table.count; ++i)
+            fprintf (stderr, "  #%zu start=%llu skip=%llu radius=%.1f\n", i,
+                     (unsigned long long) pa_table.entries[i].start,
+                     (unsigned long long) pa_table.entries[i].skip,
+                     pa_table.entries[i].radius);
+        }
+    }
+  else
+    pa_clear (&pa_table);
 
   mpfr_set (orbit_cache.c_re, s.scene->c_re, MPFR_RNDN);
   mpfr_set (orbit_cache.c_im, s.scene->c_im, MPFR_RNDN);
@@ -1995,6 +2032,59 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
 
       u64 span = 0;
 
+      // Stage 3: first-order PA skips from the reference start.  It is tried
+      // before BLA because a single period can cover far more than 32 steps.
+      if (pa_table.valid)
+        {
+          f64 pe_re, pe_im, pd_re, pd_im;
+
+          if (pa_try_skip (&pa_table, iter_orbit,
+                           epsilon_re, epsilon_im,
+                           delta_re, delta_im, deriv_re, deriv_im,
+                           &pe_re, &pe_im, &pd_re, &pd_im, &span)
+              && span > 0 && iter + span <= s.scene->iter_max
+              && iter_orbit + span <= s.scene->iter_max)
+            {
+              epsilon_re = pe_re;
+              epsilon_im = pe_im;
+              deriv_re = pd_re;
+              deriv_im = pd_im;
+              atomic_fetch_add (&pa_skips_applied, 1);
+              iter += span;
+              iter_orbit += span;
+
+              f64 rr, ri;
+
+              if (!orbit_at (&reference_orbit, iter_orbit, &rr, &ri))
+                return 0.0;
+
+              const f64 zr = rr + epsilon_re;
+              const f64 zi = ri + epsilon_im;
+              const f64 z2 = zr * zr + zi * zi;
+
+              if (z2 > bailout2)
+                {
+                  const f64 a = zr * deriv_re + zi * deriv_im;
+                  const f64 bb = zi * deriv_re - zr * deriv_im;
+                  const f64 len = hypot (a, bb);
+
+                  if (nx) *nx = len > 0.0 ? a / len : 0.0;
+                  if (ny) *ny = len > 0.0 ? bb / len : 0.0;
+
+                  return fmax (0.0, iter + 1 - log (log (z2) * 0.5) / F64_LN2);
+                }
+
+              if (epsilon_re * epsilon_re + epsilon_im * epsilon_im > z2 / 2.0)
+                {
+                  epsilon_re = zr;
+                  epsilon_im = zi;
+                  iter_orbit = 0;
+                }
+
+              continue;
+            }
+        }
+
       if (bla_table.valid
           && iter_orbit % BLA_BASE_STEP == 0
           && iter_orbit + BLA_BASE_STEP <= s.scene->iter_max
@@ -2422,6 +2512,17 @@ main (i32 argc, char **argv)
 
   if (getenv ("MANDEX_ORBIT_FLAT") && strcmp (getenv ("MANDEX_ORBIT_FLAT"), "0") == 0)
     orbit_flat_allowed = false;
+
+  if (getenv ("MANDEX_PA"))
+    pa_enabled = true;
+
+  if (getenv ("MANDEX_PA_EPS"))
+    {
+      const long bits = strtol (getenv ("MANDEX_PA_EPS"), NULL, 10);
+
+      if (bits >= 8 && bits <= 60)
+        pa_epsilon = exp2 (-(f64) bits);
+    }
 
   dump_prefix = getenv ("MANDEX_DUMP");
 
@@ -2990,6 +3091,7 @@ main (i32 argc, char **argv)
   keyframe_image = image_create (s.w, s.h);
 
   orbit_init (&reference_orbit);
+  pa_init (&pa_table);
 
   s.ss = 1;
 
@@ -4450,6 +4552,7 @@ main (i32 argc, char **argv)
 
   mpfr_clears (orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
   orbit_clear (&reference_orbit);
+  pa_clear (&pa_table);
 
   if (keyframe_image)
     image_destroy (keyframe_image);
@@ -4482,6 +4585,10 @@ main (i32 argc, char **argv)
 
   TTF_Quit ();
   SDL_Quit ();
+
+  if (getenv ("MANDEX_PA_STATS"))
+    fprintf (stderr, "PA: %llu skips applied\n",
+             (unsigned long long) atomic_load (&pa_skips_applied));
 
   printf ("Goodbye.\n");
 

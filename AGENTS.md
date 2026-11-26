@@ -82,6 +82,21 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   checkpoints still walks every iteration, so 10^16 needs stages 3-4
   (rebase + MPA skips) as well.
 
+## First-order PA (stage 3)
+- `src/pa.c`/`pa.h`: RFF-style first-order PA, `eps' = an*eps + bn*dc`,
+  coefficients as mantissa + binary exponent, with the `PAGenerator` radius
+  guard `(epsilon*|2Z| - |bn|*dcMax)/|an|`. Opt-in via `MANDEX_PA=1`,
+  `MANDEX_PA_EPS=N` (bits, default 30), `MANDEX_PA_STATS=1`.
+- RFF's `MPAView::uLookup()` rejects `refIteration == 0`: PA coefficients from
+  `Z_0 = 0` are invalid. Our entries therefore start at BLA-aligned iterations
+  >= 32, and store the longest guard-valid length (not a fixed horizon) so
+  BLA alignment survives the skip.
+- Pixel identity verified on default, mid-deep and deep BLA scenes (MD5s
+  unchanged). Enabling PA is currently SLOWER on deep scenes (16M: 143 s vs
+  22 s): the linearized eps changes BLA's radius decisions, and the naive
+  table is O(entries × skip) (capped at `PA_MAX_ENTRIES` 8192). It stays
+  default-off groundwork until stage 4's hierarchical MPA table replaces it.
+
 ## Iteration ceiling
 - `MAX_ITER_MAX` is **33554432** (2^25, was 2^24). It is a hard clamp in
   `apply_iter_max()`, the adaptive controller and the reverse-video generator;
