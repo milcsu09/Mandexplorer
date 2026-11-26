@@ -40,6 +40,11 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - `orbit_ready` stays true after a render, so queueing `compute_orbit` must
   clear it first; otherwise the next tick starts render workers while
   `compute_orbit` rebuilds `bla_table` (use-after-free in `bla_try_skip`).
+- `compute_orbit()` uses a **dynamic MPFR precision** (`orbit_precision()`):
+  `-log2(width) + log2(iter_max) + 64`, clamped to [160, FLOAT_PREC].  Fixed
+  2048 bits made the orbit loop dominate (2.5 s per 262144 iterations vs
+  0.4 s at 182 bits); view centres, recording and period detection keep
+  `FLOAT_PREC` so they are unaffected.
 - The reference-orbit delta is computed from the exact MPFR centres, not as a
   double subtraction (which quantises to ~2e-16 and is useless at deep zoom).
   In vibe only, the orbit is reused while the cached centre stays within half

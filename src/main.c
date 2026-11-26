@@ -1185,6 +1185,29 @@ apply_iter_max (u64 iter_max)
 }
 
 
+// Only the reference-orbit arithmetic needs a precision tied to the view:
+// the orbit is stored into doubles anyway.  FLOAT_PREC (2048 bits) is ~20x
+// more than a 1e-31 view needs and makes the iteration loop dominate deep
+// renders.  Keep ~64 guard bits over the view depth plus the iteration count.
+static mpfr_prec_t
+orbit_precision (void)
+{
+  const f64 width = s.scene->width;
+
+  if (!(width > 0.0) || !isfinite (width))
+    return FLOAT_PREC;
+
+  f64 bits = -log2 (width) + log2 ((f64) s.scene->iter_max) + 64.0;
+
+  if (bits < 160.0)
+    bits = 160.0;
+  if (bits > (f64) FLOAT_PREC)
+    bits = (f64) FLOAT_PREC;
+
+  return (mpfr_prec_t) bits;
+}
+
+
 void
 compute_orbit (void *argument)
 {
@@ -1202,7 +1225,7 @@ compute_orbit (void *argument)
 
   mpfr_t two, z_re, z_im, z_re_new, t;
 
-  mpfr_inits2 (FLOAT_PREC, two, z_re, z_im, z_re_new, t, (mpfr_ptr)NULL);
+  mpfr_inits2 (orbit_precision (), two, z_re, z_im, z_re_new, t, (mpfr_ptr)NULL);
 
   mpfr_set_d (two, 2.0, MPFR_RNDN);
   mpfr_set_d (z_re, 0.0, MPFR_RNDN);
