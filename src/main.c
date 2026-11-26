@@ -249,14 +249,11 @@ static bool preview_job_pending = false;
 static bool preview_result_ready = false;
 static struct image *preview_job_src = NULL;  // half-res snapshot for worker
 static struct image *preview_job_dst = NULL;  // full-res result from worker
-// s.image is the single display buffer in every mode.  The half-res render
-// writes to preview_render_image; a completed frame is copied into s.image
-// either bilinearly (immediately) or by FSRCNN (shortly afterwards).
-static u32 preview_render_gen = 0;
-static u32 preview_display_gen = 0;
-// During vibe only the live bilinear stream is shown; mixing FSRCNN frames
-// into the same buffer produces sharp/soft flips on every render.
-static bool vibe_now = false;
+static struct image *preview_fast_image = NULL;  // live bilinear fallback
+static u32 preview_fast_stamp = 0;
+// Once a neural frame exists we keep presenting it; flipping back to the
+// partial bilinear image on every new render is what makes vibe jerky.
+static bool preview_final_valid = false;
 
 // log2 safety margin between |dz| and a BLA step's validity radius.
 static f64 bla_margin = 16.0;
@@ -459,68 +456,6 @@ preview_update_dims (void);
 
 static void
 preview_restart (void);
-
-// Resample the single display buffer with the pending transform and reset the
-// transform to identity (Goose bake_display).  Scene and pixels are rebased
-// together, so starting a new render never snaps the view backwards.
-static void
-bake_display (void)
-{
-  if (s.scale == 1.0 && s.pan_x == 0.0 && s.pan_y == 0.0)
-    return;
-
-  struct image *tmp = image_create (s.w, s.h);
-
-  if (tmp)
-    {
-      const f64 inv = 1.0 / s.scale;
-
-      for (i32 y = 0; y < s.h; ++y)
-        {
-          const f64 vy = (((f64) y + 0.5) / (f64) s.h - 0.5) * inv
-                         + 0.5 + s.pan_y / (f64) s.h;
-
-          for (i32 x = 0; x < s.w; ++x)
-            {
-              const f64 vx = (((f64) x + 0.5) / (f64) s.w - 0.5) * inv
-                             + 0.5 + s.pan_x / (f64) s.w;
-
-              image_set2 (tmp, x, y,
-                          bilinear_sample (s.image,
-                                           vx * (f64) s.w - 0.5,
-                                           vy * (f64) s.h - 0.5));
-            }
-        }
-
-      image_copy (s.image, tmp);
-      image_destroy (tmp);
-    }
-
-  s.pan_x = 0.0;
-  s.pan_y = 0.0;
-  s.scale = 1.0;
-}
-
-
-static void
-bake_view (void)
-{
-  if (s.scale == 1.0 && s.pan_x == 0.0 && s.pan_y == 0.0)
-    return;
-
-  mpfr_add_d (s.scene->c_re, s.scene->c_re,
-              s.pan_x * s.scene->width / (f64) s.w, MPFR_RNDN);
-  mpfr_sub_d (s.scene->c_im, s.scene->c_im,
-              s.pan_y * s.scene->width / (f64) s.w, MPFR_RNDN);
-  s.scene->width /= s.scale;
-
-  bake_display ();
-
-  // Results in flight were rendered for the old view.
-  terminate ();
-  s.redraw = true;
-}
-
 
 static void
 start_render_phase (void)
@@ -966,11 +901,17 @@ preview_restart (void)
 
   if (preview_job_src) image_destroy (preview_job_src);
   if (preview_job_dst) image_destroy (preview_job_dst);
+  if (preview_fast_image) image_destroy (preview_fast_image);
+
   preview_job_src = image_create (render_w, render_h);
   preview_job_dst = image_create (s.w, s.h);
+  preview_fast_image = image_create (s.w, s.h);
+
   preview_stop = false;
   preview_job_pending = false;
   preview_result_ready = false;
+  preview_final_valid = false;
+
   if (pthread_create (&preview_thread, NULL, preview_thread_main, NULL) == 0)
     preview_thread_started = true;
 }
@@ -1001,8 +942,6 @@ preview_submit_job (void)
       || !preview_thread_started || !preview_render_image)
     return;
 
-  ++preview_render_gen;
-
   pthread_mutex_lock (&preview_mutex);
 
   // At most one job in flight; the newest completed frame wins.
@@ -1017,10 +956,9 @@ preview_submit_job (void)
 }
 
 
-// Returns s.image, the one buffer the display and the texture upload use.
-// A finished render is copied in bilinearly right away; FSRCNN replaces it
-// with a sharper version when the worker finishes.  No second display buffer
-// exists, so rebaking the display transform is always rebaking what is shown.
+// Returns the image the display should present this tick: the finished
+// neural upscale when available, otherwise a cheap live bilinear preview of
+// the half-res buffer so the zoom never freezes.
 static struct image *
 preview_display_image (void)
 {
@@ -1032,35 +970,37 @@ preview_display_image (void)
   pthread_mutex_lock (&preview_mutex);
   if (preview_result_ready)
     {
-      // In vibe we keep the live bilinear stream; adopting the neural frame
-      // here would flip the single display buffer between sharp and soft.
-      if (!vibe_now)
-        {
-          image_copy (preview_job_dst, s.image);
-          have_result = true;
-        }
-
+      image_copy (preview_job_dst, s.image);
       preview_result_ready = false;
-      ++preview_display_gen;
+      have_result = true;
+      preview_final_valid = true;
     }
   pthread_mutex_unlock (&preview_mutex);
 
-  if (!have_result && preview_display_gen < preview_render_gen
-      && preview_render_image)
+  // Keep the last complete neural frame on screen until the next one arrives.
+  // The bilinear image is only a stopgap before the very first result.
+  if (have_result || preview_final_valid
+      || !preview_fast_image || !preview_render_image)
+    return s.image;
+
+  // Throttle: doing a full-screen bilinear pass on every display tick costs
+  // more CPU than the render itself at deep zoom.  4 Hz is enough for a live
+  // progress indicator.
+  const u32 now = SDL_GetTicks ();
+  if (now - preview_fast_stamp >= 250)
     {
       for (i32 y = 0; y < s.h; ++y)
         for (i32 x = 0; x < s.w; ++x)
           {
             const f64 sx = ((f64) x + 0.5) * (f64) render_w / (f64) s.w - 0.5;
             const f64 sy = ((f64) y + 0.5) * (f64) render_h / (f64) s.h - 0.5;
-            image_set2 (s.image, x, y,
+            image_set2 (preview_fast_image, x, y,
                         bilinear_sample (preview_render_image, sx, sy));
           }
-
-      preview_display_gen = preview_render_gen;
+      preview_fast_stamp = now;
     }
 
-  return s.image;
+  return preview_fast_image;
 }
 
 
@@ -2845,7 +2785,6 @@ main (i32 argc, char **argv)
 
               case SDLK_v:
                 vibe = !vibe;
-                vibe_now = vibe;
                 printf ("Vibe zoom: %s\n", vibe ? "on" : "off");
 
                 if (vibe)
@@ -3065,7 +3004,6 @@ main (i32 argc, char **argv)
 
                     // Vibe zoom gives a smooth trajectory while recording.
                     vibe = true;
-                    vibe_now = true;
 
                     printf ("Recording started\n");
                   }
@@ -3074,7 +3012,6 @@ main (i32 argc, char **argv)
                     recording = false;
 
                     vibe = false;
-                    vibe_now = false;
 
                     if (recorded_count == 0)
                       {
@@ -3280,37 +3217,43 @@ main (i32 argc, char **argv)
 
       if (vibe)
         {
+          static u64 vibe_counter = 0;
+          vibe_counter++;
+
           i32 mx, my;
           SDL_GetMouseState (&mx, &my);
           const f64 sx = mx - s.w / 2.0;
           const f64 sy = my - s.h / 2.0;
 
-          // Adopt a completed GPU frame at a commit boundary.
-          if (atomic_load (&gpu_vibe_done))
+          const f64 zoom = 1.02;
+
+          const f64 world_x = (sx / s.scale) + s.pan_x;
+          const f64 world_y = (sy / s.scale) + s.pan_y;
+          s.scale *= zoom;
+          s.pan_x = world_x - (sx / s.scale);
+          s.pan_y = world_y - (sy / s.scale);
+
+          // Refresh the underlying render periodically, but never while the
+          // background GPU job is in flight: terminating then would block on
+          // it.  A completed GPU frame is adopted here, at a commit boundary,
+          // so the accumulated zoom baked into the scene is small and the
+          // view does not jump.
+          if (vibe_counter % 15 == 0
+              && !gpu_job_active && !gpu_vibe_inflight)
             {
-              atomic_store (&gpu_vibe_done, false);
-              for (i32 y = 0; y < s.image->h; ++y)
-                for (i32 x = 0; x < s.image->w; ++x)
-                  image_set2 (s.image, x, y,
-                              image_get2 (gpu_vibe_image, x, y));
+              terminate ();
+
+              if (atomic_load (&gpu_vibe_done))
+                {
+                  atomic_store (&gpu_vibe_done, false);
+                  for (i32 y = 0; y < s.image->h; ++y)
+                    for (i32 x = 0; x < s.image->w; ++x)
+                      image_set2 (s.image, x, y,
+                                  image_get2 (gpu_vibe_image, x, y));
+                }
+
+              s.redraw = true;
             }
-
-          // Do not magnify a stale frame past ~1.2x while a render is running.
-          if (!(s.phase != PHASE_IDLE && s.scale >= 1.2))
-            {
-              const f64 wx = sx / s.scale + s.pan_x;
-              const f64 wy = sy / s.scale + s.pan_y;
-
-              s.scale *= 1.02;
-              s.pan_x = wx - sx / s.scale;
-              s.pan_y = wy - sy / s.scale;
-            }
-
-          // Dispatch a fresh render only when the displayed frame drifted
-          // enough.  bake_view() rebakes scene AND pixels together.
-          const f64 hard = s.phase != PHASE_IDLE ? 5.0 : 1.02;
-          if (s.scale >= hard && !gpu_job_active && !gpu_vibe_inflight)
-            bake_view ();
         }
 
       // Capture effective view while recording.
@@ -3514,7 +3457,14 @@ main (i32 argc, char **argv)
 
               SDL_RenderCopyF (s.renderer, s.texture_helper, NULL, &vr);
 
-              bake_view ();
+              mpfr_add_d (s.scene->c_re, s.scene->c_re, s.pan_x * s.scene->width / s.w, MPFR_RNDN);
+              mpfr_sub_d (s.scene->c_im, s.scene->c_im, s.pan_y * s.scene->width / s.w, MPFR_RNDN);
+
+              s.scene->width /= s.scale;
+
+              s.pan_x = 0.0L;
+              s.pan_y = 0.0L;
+              s.scale = 1.0L;
 
               {
                 i32 mx, my;
@@ -3535,7 +3485,7 @@ main (i32 argc, char **argv)
               // s.image holds the last neural frame and must stay intact.
               if (preview_active () && preview_div > 1)
                 image_fill (preview_render_image, color_argb (0, 0, 0, 0));
-              else if (!preview_active ())
+              else if (!preview_final_valid)
                 image_fill (s.image, color_argb (0, 0, 0, 0));
 
               atomic_store (&s.tiles_done, 0);
@@ -4144,6 +4094,7 @@ main (i32 argc, char **argv)
 
   if (preview_job_src) image_destroy (preview_job_src);
   if (preview_job_dst) image_destroy (preview_job_dst);
+  if (preview_fast_image) image_destroy (preview_fast_image);
   if (preview_render_image) image_destroy (preview_render_image);
 
   free (render_pixels);
