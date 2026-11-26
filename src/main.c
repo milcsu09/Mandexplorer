@@ -251,6 +251,9 @@ static struct image *preview_job_src = NULL;  // half-res snapshot for worker
 static struct image *preview_job_dst = NULL;  // full-res result from worker
 static struct image *preview_fast_image = NULL;  // live bilinear fallback
 static u32 preview_fast_stamp = 0;
+// Once a neural frame exists we keep presenting it; flipping back to the
+// partial bilinear image on every new render is what makes vibe jerky.
+static bool preview_final_valid = false;
 
 // log2 safety margin between |dz| and a BLA step's validity radius.
 static f64 bla_margin = 16.0;
@@ -382,6 +385,15 @@ static bool rendering_video = false;
 static bool video_frame_pending = false;
 static usize render_index = 0;
 
+// Preview is for navigation only.  While recording or rendering the video the
+// full-resolution fractal must be written straight into s.image: no half-res
+// render, no neural upscale, no FSRCNN output in the final MP4.
+static bool
+preview_active (void)
+{
+  return preview_mode && !recording && !rendering_video;
+}
+
 static void
 recorded_views_free (void)
 {
@@ -440,9 +452,25 @@ static u32
 bilinear_sample (const struct image *img, f64 x, f64 y);
 
 static void
+preview_update_dims (void);
+
+static void
+preview_restart (void);
+
+static void
 start_render_phase (void)
 {
   rendering_video = true;
+
+  // Video frames must be rendered at full resolution into s.image; switch the
+  // preview pipeline back to full size before any frame is scheduled.
+  if (preview_mode)
+    {
+      terminate ();
+      preview_update_dims ();
+      preview_restart ();
+    }
+
   render_index = 0;
   video_frame_pending = false;
   has_keyframe = false;
@@ -724,7 +752,7 @@ preview_init_root (void)
 static void
 preview_update_dims (void)
 {
-  if (preview_mode)
+  if (preview_active ())
     {
       render_w = s.w / preview_div;
       render_h = s.h / preview_div;
@@ -882,6 +910,7 @@ preview_restart (void)
   preview_stop = false;
   preview_job_pending = false;
   preview_result_ready = false;
+  preview_final_valid = false;
 
   if (pthread_create (&preview_thread, NULL, preview_thread_main, NULL) == 0)
     preview_thread_started = true;
@@ -909,7 +938,7 @@ preview_submit_job (void)
 {
   // FSRCNN x2 only matches a half-resolution render.  At full resolution the
   // image is already crisp; at other divisors only the live fallback is used.
-  if (!preview_mode || preview_div != 2
+  if (!preview_active () || preview_div != 2
       || !preview_thread_started || !preview_render_image)
     return;
 
@@ -933,7 +962,7 @@ preview_submit_job (void)
 static struct image *
 preview_display_image (void)
 {
-  if (!preview_mode || preview_div == 1)
+  if (!preview_active () || preview_div == 1)
     return s.image;
 
   bool have_result = false;
@@ -944,10 +973,14 @@ preview_display_image (void)
       image_copy (preview_job_dst, s.image);
       preview_result_ready = false;
       have_result = true;
+      preview_final_valid = true;
     }
   pthread_mutex_unlock (&preview_mutex);
 
-  if (have_result || !preview_fast_image || !preview_render_image)
+  // Keep the last complete neural frame on screen until the next one arrives.
+  // The bilinear image is only a stopgap before the very first result.
+  if (have_result || preview_final_valid
+      || !preview_fast_image || !preview_render_image)
     return s.image;
 
   // Throttle: doing a full-screen bilinear pass on every display tick costs
@@ -1098,7 +1131,10 @@ compute_orbit (void *argument)
   for (u64 iter = 0; iter <= s.scene->iter_max; iter++)
     {
       if (s.work_generation != atomic_load (&s.generation))
-        return;
+        {
+          mpfr_clears (two, z_re, z_im, z_re_new, t, (mpfr_ptr)NULL);
+          return;
+        }
 
       s.orbit_re[iter] = mpfr_get_d (z_re, MPFR_RNDN);
       s.orbit_im[iter] = mpfr_get_d (z_im, MPFR_RNDN);
@@ -1929,7 +1965,7 @@ worker (void *argument)
   const f64 scale = s.scene->width / (f64) render_w;
 
   struct image *target =
-    (preview_mode && preview_div > 1) ? preview_render_image : s.image;
+    (preview_active () && preview_div > 1) ? preview_render_image : s.image;
 
   const usize offset = work->offset;
   const usize stride = work->stride;
@@ -2957,6 +2993,15 @@ main (i32 argc, char **argv)
 
                     recording = true;
 
+                    // Recording captures full-resolution frames: suspend the
+                    // half-res/FSRCNN preview for the whole recording session.
+                    if (preview_mode)
+                      {
+                        terminate ();
+                        preview_update_dims ();
+                        preview_restart ();
+                      }
+
                     // Vibe zoom gives a smooth trajectory while recording.
                     vibe = true;
 
@@ -2971,6 +3016,13 @@ main (i32 argc, char **argv)
                     if (recorded_count == 0)
                       {
                         printf ("No frames recorded\n");
+
+                        if (preview_mode)
+                          {
+                            terminate ();
+                            preview_update_dims ();
+                            preview_restart ();
+                          }
                       }
                     else
                       {
@@ -3427,7 +3479,14 @@ main (i32 argc, char **argv)
                 s.mouse_cy = my;
               }
 
-              image_fill (s.image, color_argb (0, 0, 0, 0));
+              // Clear the buffer the render workers actually write to.  In
+              // preview mode that is the half-res buffer; leaving it uncleared
+              // kept stale pixels from previous vibe frames (ghosting).
+              // s.image holds the last neural frame and must stay intact.
+              if (preview_active () && preview_div > 1)
+                image_fill (preview_render_image, color_argb (0, 0, 0, 0));
+              else if (!preview_final_valid)
+                image_fill (s.image, color_argb (0, 0, 0, 0));
 
               atomic_store (&s.tiles_done, 0);
 
@@ -3490,6 +3549,13 @@ main (i32 argc, char **argv)
                 {
                   delta_c_re = 0.0;
                   delta_c_im = 0.0;
+
+                  // orbit_ready is still true from the previous frame.  Clear
+                  // it before queueing compute_orbit, otherwise the next tick
+                  // starts render workers while compute_orbit is rebuilding
+                  // bla_table -> use-after-free in bla_try_skip().
+                  atomic_store (&s.orbit_ready, false);
+
                   thread_pool_enqueue (s.pool, compute_orbit, NULL);
                 }
             }
@@ -3539,8 +3605,10 @@ main (i32 argc, char **argv)
                   if (render_pixels)
                     {
                       i32 maxr2 = 0;
-                      const i32 mcx = preview_mode ? s.mouse_cx / preview_div : s.mouse_cx;
-                      const i32 mcy = preview_mode ? s.mouse_cy / preview_div : s.mouse_cy;
+                      const i32 mcx =
+                        preview_active () ? s.mouse_cx / preview_div : s.mouse_cx;
+                      const i32 mcy =
+                        preview_active () ? s.mouse_cy / preview_div : s.mouse_cy;
                       const i32 dxs[2] = { mcx, render_w - 1 - mcx };
                       const i32 dys[2] = { mcy, render_h - 1 - mcy };
 
@@ -3801,6 +3869,15 @@ main (i32 argc, char **argv)
                 }
 
               rendering_video = false;
+
+              // Navigation preview resumes only after the last video frame;
+              // restoring it earlier would let the neural upscale leak into
+              // the remaining frames of the MP4.
+              if (preview_mode)
+                {
+                  preview_update_dims ();
+                  preview_restart ();
+                }
 
               printf ("Recording render finished: %zu frames -> '%s'\n",
                       recorded_count, video_path);
