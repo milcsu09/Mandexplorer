@@ -173,6 +173,14 @@ static _Atomic bool gpu_job_active;
 static _Atomic bool gpu_vibe_done;
 static _Atomic bool gpu_vibe_inflight;
 
+// During vibe the canvas keeps the frame baked at the last scene rebase until
+// the next full render is ready.  Uploading the stale image over the baked
+// pixels is what makes the view snap back on every rebase.
+static bool canvas_frozen = false;
+
+// File scope so the preview path knows whether this is a vibe stream.
+static bool vibe = false;
+
 static usize *render_counts = NULL;
 static usize render_counts_cap = 0;
 
@@ -436,6 +444,8 @@ terminate (void)
   atomic_store (&s.orbit_ready, false);
 
   atomic_store (&s.tiles_done, 0);
+
+  canvas_frozen = false;
 }
 
 
@@ -964,6 +974,31 @@ preview_display_image (void)
 {
   if (!preview_active () || preview_div == 1)
     return s.image;
+
+  // The neural result belongs to an older scene and arrives too late.  In
+  // vibe we show the live half-res stream so the frame swapped in when the
+  // canvas unfreezes always matches the current scene.
+  if (vibe)
+    {
+      if (!preview_fast_image || !preview_render_image)
+        return s.image;
+
+      pthread_mutex_lock (&preview_mutex);
+      if (preview_result_ready)
+        preview_result_ready = false;
+      pthread_mutex_unlock (&preview_mutex);
+
+      for (i32 y = 0; y < s.h; ++y)
+        for (i32 x = 0; x < s.w; ++x)
+          {
+            const f64 sx = ((f64) x + 0.5) * (f64) render_w / (f64) s.w - 0.5;
+            const f64 sy = ((f64) y + 0.5) * (f64) render_h / (f64) s.h - 0.5;
+            image_set2 (preview_fast_image, x, y,
+                        bilinear_sample (preview_render_image, sx, sy));
+          }
+
+      return preview_fast_image;
+    }
 
   bool have_result = false;
 
@@ -2753,7 +2788,6 @@ main (i32 argc, char **argv)
 
   bool ui_info = false;
   bool ui_help = false;
-  bool vibe = false;
 
   while (s.running)
     {
@@ -2785,6 +2819,8 @@ main (i32 argc, char **argv)
 
               case SDLK_v:
                 vibe = !vibe;
+                if (!vibe)
+                  canvas_frozen = false;
                 printf ("Vibe zoom: %s\n", vibe ? "on" : "off");
 
                 if (vibe)
@@ -3217,9 +3253,6 @@ main (i32 argc, char **argv)
 
       if (vibe)
         {
-          static u64 vibe_counter = 0;
-          vibe_counter++;
-
           i32 mx, my;
           SDL_GetMouseState (&mx, &my);
           const f64 sx = mx - s.w / 2.0;
@@ -3233,26 +3266,18 @@ main (i32 argc, char **argv)
           s.pan_x = world_x - (sx / s.scale);
           s.pan_y = world_y - (sy / s.scale);
 
-          // Refresh the underlying render periodically, but never while the
-          // background GPU job is in flight: terminating then would block on
-          // it.  A completed GPU frame is adopted here, at a commit boundary,
-          // so the accumulated zoom baked into the scene is small and the
-          // view does not jump.
-          if (vibe_counter % 15 == 0
-              && !gpu_job_active && !gpu_vibe_inflight)
+          // Adopt a finished background GPU frame at an idle boundary; never
+          // while CPU workers are filling s.image.  Renders are no longer
+          // killed by a frame counter: each one completes and the canvas is
+          // swapped to it, so rebasing never happens on a partial frame.
+          if (s.phase != PHASE_COMPUTE_IMAGE
+              && atomic_load (&gpu_vibe_done))
             {
-              terminate ();
-
-              if (atomic_load (&gpu_vibe_done))
-                {
-                  atomic_store (&gpu_vibe_done, false);
-                  for (i32 y = 0; y < s.image->h; ++y)
-                    for (i32 x = 0; x < s.image->w; ++x)
-                      image_set2 (s.image, x, y,
-                                  image_get2 (gpu_vibe_image, x, y));
-                }
-
-              s.redraw = true;
+              atomic_store (&gpu_vibe_done, false);
+              for (i32 y = 0; y < s.image->h; ++y)
+                for (i32 x = 0; x < s.image->w; ++x)
+                  image_set2 (s.image, x, y,
+                              image_get2 (gpu_vibe_image, x, y));
             }
         }
 
@@ -3456,6 +3481,11 @@ main (i32 argc, char **argv)
               vr.h = s.h * s.scale;
 
               SDL_RenderCopyF (s.renderer, s.texture_helper, NULL, &vr);
+
+              // Keep these baked pixels on screen while the next render is
+              // produced; the stale image must not overwrite them.
+              if (vibe)
+                canvas_frozen = true;
 
               mpfr_add_d (s.scene->c_re, s.scene->c_re, s.pan_x * s.scene->width / s.w, MPFR_RNDN);
               mpfr_sub_d (s.scene->c_im, s.scene->c_im, s.pan_y * s.scene->width / s.w, MPFR_RNDN);
@@ -3769,6 +3799,9 @@ main (i32 argc, char **argv)
             {
               compute_image_total = SDL_GetTicks () - compute_image_start;
 
+              // The buffer now holds a full frame for the current scene.
+              canvas_frozen = false;
+
               preview_submit_job ();
 
               const bool can_probe = auto_iter
@@ -3893,7 +3926,7 @@ main (i32 argc, char **argv)
       // to upload and show the expanding circle of progress.)
       const bool gpu_busy = atomic_load (&gpu_job_active);
 
-      const bool vibe_upload_ok = !gpu_busy;
+      const bool vibe_upload_ok = !gpu_busy && !canvas_frozen;
 
       if (vibe_upload_ok)
         {
