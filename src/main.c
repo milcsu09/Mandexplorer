@@ -3029,6 +3029,17 @@ main (i32 argc, char **argv)
     SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC
   );
 
+  // Headless servers (SDL_VIDEODRIVER=dummy, no GL) have no accelerated
+  // renderer.  Fall back to software so offline/CLI renders still work.
+  if (!s.renderer)
+    s.renderer = SDL_CreateRenderer (s.window, -1, SDL_RENDERER_SOFTWARE);
+
+  if (!s.renderer)
+    {
+      fprintf (stderr, "Could not create SDL renderer: %s\n", SDL_GetError ());
+      return 1;
+    }
+
   s.texture = SDL_CreateTexture (
     s.renderer,
     SDL_PIXELFORMAT_ARGB8888,
