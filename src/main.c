@@ -4341,6 +4341,12 @@ main (i32 argc, char **argv)
           video_frame_pending = false;
           render_index++;
 
+          // Long offline renders run for hours; keep an incremental progress
+          // line so a stuck frame is visible without attaching to the process.
+          printf ("video frame %zu/%zu (%.1f min)\n", render_index,
+                  recorded_count, (f64) SDL_GetTicks () / 60000.0);
+          fflush (stdout);
+
           if (render_index >= recorded_count)
             {
               if (ffmpeg_pipe)
