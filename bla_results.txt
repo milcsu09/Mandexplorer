@@ -1,0 +1,24 @@
+BLA verification (2026-11-22)
+=============================
+
+Binary: a_bla (gcc -O3, src/*.c)
+Scene: width=1e-40, iter_max=8192, center -0.74364388703715...+0.13182590420531i
+Renderer: CPU path (--no-gpu), SSAA=2, MANDEX_DIFF_REUSE=1, MANDEX_NO_AUTO=1
+
+320x180, 4 frames:
+  baseline (MANDEX_BLA=0): 61.659 s
+  BLA:                       3.119 s   -> 19.8x
+  pixel comparison: 4/4 frames byte-identical (PPM)
+
+640x360, 2 frames:
+  baseline: 150.215 s
+  BLA:        8.148 s        -> 18.4x
+  pixel comparison: 2/2 frames byte-identical
+
+1920x1080, SSAA=2, 2 frames:
+  BLA: 70.300 s total (35.15 s/frame)
+  baseline extrapolation from the two runs above: ~675 s/frame -> ~19x
+
+Shallow view guard: BLA is disabled for width > 1e-12.
+  At width=1e-11, 2 frames, iter_max=8192: 7.970 s with the guard
+  (baseline speed retained; enabling BLA there was slower).

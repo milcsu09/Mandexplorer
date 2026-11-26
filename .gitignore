@@ -1,0 +1,24 @@
+# Build outputs (the tracked `a` binary is intentional)
+*.o
+a_bla
+a_bla_lto
+a_nocl
+a_preview
+
+# Local render / benchmark artifacts
+*.mp4
+*.ppm
+*.png
+*.raw
+nohup.out
+
+# Local agent workspace state
+.jspace/
+repo-map.json
+completion.txt
+bla_results_r2.txt
+
+# Neural preview runtime (install with: python -m venv .venv-preview)
+.venv-preview/
+__pycache__/
+*.pyc
