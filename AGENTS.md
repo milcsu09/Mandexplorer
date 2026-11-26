@@ -26,12 +26,13 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 ## Vibe zoom
 - The display thread only presents the last complete texture; orbit and GPU/CPU rendering run outside it.
 - A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
-- Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
-  `--vibe-step <float>` overrides it (lower = smoother preview, slower zoom).
-- Two view transforms are kept: `s.pan/scale` for the displayed frame and
-  `render_pan/scale` for the frame being computed. Committing bakes only the
-  render transform, so the visible frame never snaps back while its successor
-  is still rendering; the display transform is adopted when a frame completes.
+- Zoom defaults to 1.02 per frame (`--vibe-step <float>` overrides it; lower =
+  smoother preview, slower zoom). Final quality (`iter_max`/SSAA/resolution)
+  is unchanged.
+- The view shown by the current frame is kept in MPFR (`disp_base_*`), as is
+  the view its successor is rendered from (`render_base_*`). The scene is
+  rebased at render start, and pan/scale are recomputed from the exact views
+  when a frame completes, so the visible zoom never snaps backwards.
 - `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
 - `orbit_ready` stays true after a render, so queueing `compute_orbit` must
   clear it first; otherwise the next tick starts render workers while
