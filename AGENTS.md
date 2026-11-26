@@ -27,6 +27,7 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - The display thread only presents the last complete texture; orbit and GPU/CPU rendering run outside it.
 - A render is never killed by a frame counter. When it completes, `PHASE_COMPUTE_IMAGE` sets `redraw` and commits the accumulated view.
 - Zoom keeps the legacy 1.02 per frame; final quality (`iter_max`/SSAA/resolution) is unchanged.
+  `--vibe-step <float>` overrides it (lower = smoother preview, slower zoom).
 - Two view transforms are kept: `s.pan/scale` for the displayed frame and
   `render_pan/scale` for the frame being computed. Committing bakes only the
   render transform, so the visible frame never snaps back while its successor

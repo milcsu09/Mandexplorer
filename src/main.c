@@ -162,15 +162,28 @@ static struct
 } s;
 
 
-// Two independent view transforms:
-//   s.pan/s.scale      -> maps the image currently on screen to the live view
-//   render_pan/scale   -> maps the scene centre (base of the frame being
-//                         rendered) to the live view.
-// They differ while a render is in flight.  Baking/clearing only the render
-// transform at commit keeps the displayed image from snapping backwards.
-static f64 render_pan_x = 0.0;
-static f64 render_pan_y = 0.0;
-static f64 render_scale = 1.0;
+// View represented by the image currently on screen, and the view the frame
+// being rendered is based on.  Rebasing must happen when a finished frame is
+// swapped in, and the display transform must be recomputed from these views;
+// rebasing at commit while keeping the old image makes the zoom snap back.
+static mpfr_t disp_base_re, disp_base_im;
+static mpfr_t render_base_re, render_base_im;
+static f64 disp_base_width = 1.0;
+static f64 render_base_width = 1.0;
+static mpfr_t view_re, view_im, view_tmp;
+static f64 view_width = 1.0;
+
+// Current live view from the displayed image's base and its transform.
+static void
+compute_view (void)
+{
+  mpfr_add_d (view_re, disp_base_re,
+              s.pan_x * disp_base_width / (f64) s.w, MPFR_RNDN);
+  mpfr_sub_d (view_im, disp_base_im,
+              s.pan_y * disp_base_width / (f64) s.w, MPFR_RNDN);
+  view_width = disp_base_width / (s.scale == 0.0 ? 1.0 : s.scale);
+}
+
 
 static struct point *render_pixels = NULL;
 static usize render_pixel_count = 0;
@@ -218,6 +231,9 @@ static u64 auto_render_ms;
 static f64 auto_sensitivity;
 static enum auto_iter_state auto_state = AUTO_HOLD;
 static f64 period_tol = 1e-40;
+// Vibe zoom factor per display tick.  Lower values make preview smoother at
+// the cost of zoom speed (the half-res frame is replaced ~10 times/s).
+static f64 vibe_step = 1.02;
 
 // At deep zoom a minibrot interior is normally pure black, which looks like
 // an unrendered hole.  Paint it dark blue so the small Mandelbrot silhouette
@@ -2150,6 +2166,7 @@ help (FILE *f, const char *self)
   fprintf (f, "  --preview                      Preview mode: reduced-res render, async upscale\n");
   fprintf (f, "  --fullscreen                   Use the desktop resolution as the window size\n");
   fprintf (f, "  --preview-div  <int>          Preview render divisor: 1 full, 2 + FSRCNN (default 2)\n");
+  fprintf (f, "  --vibe-step <float>           Vibe zoom per frame (default 1.02; lower = smoother)\n");
   fprintf (f, "  --gpu-info                     Print GPU info and exit\n");
   fprintf (f, "\n");
   fprintf (f, "SCENE:\n");
@@ -2506,6 +2523,24 @@ main (i32 argc, char **argv)
           continue;
         }
 
+      if (strcmp (arg, "--vibe-step") == 0)
+        {
+          if (i + 1 >= argc)
+            {
+              fprintf (stderr, "Error: '--vibe-step' requires a float\n");
+              return 1;
+            }
+          const double v = strtod (argv[++i], NULL);
+          if (!(v > 1.0 && v < 2.0))
+            {
+              fprintf (stderr, "Error: '--vibe-step' must be in (1, 2)\n");
+              return 1;
+            }
+          vibe_step = (f64) v;
+          ++i;
+          continue;
+        }
+
       if (strcmp (arg, "--preview-div") == 0)
         {
           if (i + 1 >= argc)
@@ -2711,6 +2746,9 @@ main (i32 argc, char **argv)
   orbit_cache.valid = false;
   mpfr_inits2 (FLOAT_PREC, orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
   view_state_init (&keyframe_view);
+  mpfr_inits2 (FLOAT_PREC, disp_base_re, disp_base_im,
+               render_base_re, render_base_im, view_re, view_im, view_tmp,
+               (mpfr_ptr)NULL);
 
   s.sectors = SDL_GetCPUCount ();
 
@@ -2736,9 +2774,12 @@ main (i32 argc, char **argv)
   s.pan_y = 0.0L;
   s.scale = 1.0L;
 
-  render_pan_x = 0.0L;
-  render_pan_y = 0.0L;
-  render_scale = 1.0L;
+  mpfr_set (disp_base_re, s.scene->c_re, MPFR_RNDN);
+  mpfr_set (disp_base_im, s.scene->c_im, MPFR_RNDN);
+  mpfr_set (render_base_re, s.scene->c_re, MPFR_RNDN);
+  mpfr_set (render_base_im, s.scene->c_im, MPFR_RNDN);
+  disp_base_width = s.scene->width;
+  render_base_width = s.scene->width;
 
   s.redraw = true;
 
@@ -2915,9 +2956,12 @@ main (i32 argc, char **argv)
                 s.pan_y = 0.0;
                 s.scale = 1.0;
 
-                render_pan_x = 0.0;
-                render_pan_y = 0.0;
-                render_scale = 1.0;
+                mpfr_set (disp_base_re, s.scene->c_re, MPFR_RNDN);
+                mpfr_set (disp_base_im, s.scene->c_im, MPFR_RNDN);
+                mpfr_set (render_base_re, s.scene->c_re, MPFR_RNDN);
+                mpfr_set (render_base_im, s.scene->c_im, MPFR_RNDN);
+                disp_base_width = s.scene->width;
+                render_base_width = s.scene->width;
 
                 s.redraw = true;
                 break;
@@ -2935,8 +2979,6 @@ main (i32 argc, char **argv)
 
                   s.pan_x += mx / s.scale;
                   s.pan_y += my / s.scale;
-                  render_pan_x += mx / render_scale;
-                  render_pan_y += my / render_scale;
                 }
 
                 s.redraw = true;
@@ -3147,8 +3189,6 @@ main (i32 argc, char **argv)
               {
                 s.pan_x -= event.motion.xrel / s.scale;
                 s.pan_y -= event.motion.yrel / s.scale;
-                render_pan_x -= event.motion.xrel / render_scale;
-                render_pan_y -= event.motion.yrel / render_scale;
               }
             break;
 
@@ -3255,17 +3295,10 @@ main (i32 argc, char **argv)
               const f64 world_x = (anchor_x / s.scale) + s.pan_x;
               const f64 world_y = (anchor_y / s.scale) + s.pan_y;
 
-              const f64 rworld_x = (anchor_x / render_scale) + render_pan_x;
-              const f64 rworld_y = (anchor_y / render_scale) + render_pan_y;
-
               s.scale *= zoom;
-              render_scale *= zoom;
 
               s.pan_x = world_x - (anchor_x / s.scale);
               s.pan_y = world_y - (anchor_y / s.scale);
-
-              render_pan_x = rworld_x - (anchor_x / render_scale);
-              render_pan_y = rworld_y - (anchor_y / render_scale);
             }
 
             s.redraw = true;
@@ -3288,22 +3321,15 @@ main (i32 argc, char **argv)
           const f64 sx = mx - s.w / 2.0;
           const f64 sy = my - s.h / 2.0;
 
-          const f64 zoom = 1.02;
+          const f64 zoom = vibe_step;
 
           const f64 world_x = (sx / s.scale) + s.pan_x;
           const f64 world_y = (sy / s.scale) + s.pan_y;
 
-          const f64 rworld_x = (sx / render_scale) + render_pan_x;
-          const f64 rworld_y = (sy / render_scale) + render_pan_y;
-
           s.scale *= zoom;
-          render_scale *= zoom;
 
           s.pan_x = world_x - (sx / s.scale);
           s.pan_y = world_y - (sy / s.scale);
-
-          render_pan_x = rworld_x - (sx / render_scale);
-          render_pan_y = rworld_y - (sy / render_scale);
 
           // Refresh the underlying render periodically, but never while the
           // background GPU job is in flight: terminating then would block on
@@ -3339,13 +3365,12 @@ main (i32 argc, char **argv)
           // Capture the exact centre the renderer uses (the MPFR scene centre
           // plus the uncommitted pan).  s.center_re is only a double snapshot
           // and quantises the zoom target once the view is deeper than an ulp.
-          mpfr_add_d (eff_re, s.scene->c_re,
-                      render_pan_x * s.scene->width / (f64) s.w, MPFR_RNDN);
-          mpfr_sub_d (eff_im, s.scene->c_im,
-                      render_pan_y * s.scene->width / (f64) s.w, MPFR_RNDN);
+          compute_view ();
 
-          const f64 width = s.scene->width
-                            / (render_scale == 0.0 ? 1.0 : render_scale);
+          mpfr_set (eff_re, view_re, MPFR_RNDN);
+          mpfr_set (eff_im, view_im, MPFR_RNDN);
+
+          const f64 width = view_width;
 
           // A view is a duplicate only when it moved by less than a
           // thousandth of a pixel.  The old fixed 1e-12 tolerance was
@@ -3496,9 +3521,12 @@ main (i32 argc, char **argv)
               s.pan_y = 0.0;
               s.scale = 1.0;
 
-              render_pan_x = 0.0;
-              render_pan_y = 0.0;
-              render_scale = 1.0;
+              mpfr_set (disp_base_re, s.scene->c_re, MPFR_RNDN);
+              mpfr_set (disp_base_im, s.scene->c_im, MPFR_RNDN);
+              mpfr_set (render_base_re, s.scene->c_re, MPFR_RNDN);
+              mpfr_set (render_base_im, s.scene->c_im, MPFR_RNDN);
+              disp_base_width = s.scene->width;
+              render_base_width = s.scene->width;
 
               s.center_re = mpfr_get_d (s.scene->c_re, MPFR_RNDN);
               s.center_im = mpfr_get_d (s.scene->c_im, MPFR_RNDN);
@@ -3536,18 +3564,17 @@ main (i32 argc, char **argv)
 
               SDL_RenderCopyF (s.renderer, s.texture_helper, NULL, &vr);
 
-              // Bake only the render transform: the displayed image keeps its
-              // own transform until the freshly rendered frame replaces it.
-              mpfr_add_d (s.scene->c_re, s.scene->c_re,
-                          render_pan_x * s.scene->width / s.w, MPFR_RNDN);
-              mpfr_sub_d (s.scene->c_im, s.scene->c_im,
-                          render_pan_y * s.scene->width / s.w, MPFR_RNDN);
+              // Rebase the scene to the live view, but leave the display
+              // transform alone: it still maps the old image to this view.
+              compute_view ();
 
-              s.scene->width /= render_scale;
+              mpfr_set (s.scene->c_re, view_re, MPFR_RNDN);
+              mpfr_set (s.scene->c_im, view_im, MPFR_RNDN);
+              s.scene->width = view_width;
 
-              render_pan_x = 0.0L;
-              render_pan_y = 0.0L;
-              render_scale = 1.0L;
+              mpfr_set (render_base_re, view_re, MPFR_RNDN);
+              mpfr_set (render_base_im, view_im, MPFR_RNDN);
+              render_base_width = view_width;
 
               {
                 i32 mx, my;
@@ -3850,12 +3877,24 @@ main (i32 argc, char **argv)
             {
               compute_image_total = SDL_GetTicks () - compute_image_start;
 
-              // The finished frame is based on the scene centre baked at the
-              // last commit.  Adopt the render transform so the new frame is
-              // displayed at exactly the same place as the old one was.
-              s.pan_x = render_pan_x;
-              s.pan_y = render_pan_y;
-              s.scale = render_scale;
+              // Rebase onto the finished frame and recompute the display
+              // transform so the view stays exactly where it was.
+              compute_view ();
+
+
+              mpfr_set (disp_base_re, render_base_re, MPFR_RNDN);
+              mpfr_set (disp_base_im, render_base_im, MPFR_RNDN);
+              disp_base_width = render_base_width;
+
+              s.scale = disp_base_width / view_width;
+
+              mpfr_sub (view_tmp, view_re, disp_base_re, MPFR_RNDN);
+              s.pan_x = mpfr_get_d (view_tmp, MPFR_RNDN)
+                        * (f64) s.w / disp_base_width;
+
+              mpfr_sub (view_tmp, view_im, disp_base_im, MPFR_RNDN);
+              s.pan_y = -mpfr_get_d (view_tmp, MPFR_RNDN)
+                        * (f64) s.w / disp_base_width;
 
               preview_submit_job ();
 
@@ -4180,6 +4219,8 @@ main (i32 argc, char **argv)
   terminate ();
 
   mpfr_clears (orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
+  mpfr_clears (disp_base_re, disp_base_im, render_base_re, render_base_im,
+               view_re, view_im, view_tmp, (mpfr_ptr)NULL);
 
   if (keyframe_image)
     image_destroy (keyframe_image);
