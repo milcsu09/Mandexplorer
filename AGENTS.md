@@ -69,10 +69,12 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - Display never blocks: `preview_display_image()` shows a live bilinear upscale
   of the half-res buffer until the worker publishes the neural result.
   At most one upscale job is in flight; newest completed frame wins.
-  After the first neural result the last complete frame stays on screen until
-  the next one arrives (no flicker back to the partial bilinear image), and
-  the half-res buffer is cleared at every commit so vibe frames do not leave
-  stale pixels. `preview_active()` is false while recording/video rendering.
+  During vibe the FSRCNN frame is deliberately **not** displayed: it arrives
+  ~1/s while the camera commits ~13/s, which snapped the view backwards at
+  every commit. Instead the freshly completed half-res frame is bilinearly
+  upscaled (`preview_render_gen`) immediately and the display's pan/scale
+  transform zooms it smoothly between frames. `preview_active()` is false
+  while recording/video rendering.
 - `--fullscreen` sizes the window to the desktop display mode (useful with
   `--preview` so the half-res render still has detail).
 - Never use preview output as final output: it invents detail.

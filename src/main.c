@@ -251,8 +251,12 @@ static struct image *preview_job_src = NULL;  // half-res snapshot for worker
 static struct image *preview_job_dst = NULL;  // full-res result from worker
 static struct image *preview_fast_image = NULL;  // live bilinear fallback
 static u32 preview_fast_stamp = 0;
-// Once a neural frame exists we keep presenting it; flipping back to the
-// partial bilinear image on every new render is what makes vibe jerky.
+// Bumped on every completed render so the live vibe image follows the newest
+// fractal frame as soon as it exists, instead of a ~1 s old neural upscale.
+static u32 preview_render_gen = 0;
+static u32 preview_fast_gen = 0;
+// Once a neural frame exists we keep presenting it while idle.  During vibe
+// the live render is shown instead (see preview_display_image).
 static bool preview_final_valid = false;
 
 // log2 safety margin between |dz| and a BLA step's validity radius.
@@ -942,6 +946,8 @@ preview_submit_job (void)
       || !preview_thread_started || !preview_render_image)
     return;
 
+  ++preview_render_gen;
+
   pthread_mutex_lock (&preview_mutex);
 
   // At most one job in flight; the newest completed frame wins.
@@ -956,18 +962,53 @@ preview_submit_job (void)
 }
 
 
-// Returns the image the display should present this tick: the finished
-// neural upscale when available, otherwise a cheap live bilinear preview of
-// the half-res buffer so the zoom never freezes.
+static void
+preview_refresh_fast (void)
+{
+  if (!preview_fast_image || !preview_render_image)
+    return;
+
+  for (i32 y = 0; y < s.h; ++y)
+    for (i32 x = 0; x < s.w; ++x)
+      {
+        const f64 sx = ((f64) x + 0.5) * (f64) render_w / (f64) s.w - 0.5;
+        const f64 sy = ((f64) y + 0.5) * (f64) render_h / (f64) s.h - 0.5;
+        image_set2 (preview_fast_image, x, y,
+                    bilinear_sample (preview_render_image, sx, sy));
+      }
+
+  preview_fast_stamp = SDL_GetTicks ();
+  preview_fast_gen = preview_render_gen;
+}
+
+
+// Returns the image the display should present this tick.
+//
+// While vibe is running the FSRCNN result is deliberately ignored: it lands
+// about once a second while the camera commits ~13 times a second, so showing
+// it makes the view snap backwards at every commit.  The live half-res render
+// is upscaled bilinearly as soon as each frame completes and the display's
+// scale/pan transform zooms it smoothly between frames.  Once vibe stops, the
+// sharp neural frame is used again.
 static struct image *
-preview_display_image (void)
+preview_display_image (bool vibe)
 {
   if (!preview_active () || preview_div == 1)
     return s.image;
 
+  if (vibe && preview_fast_image && preview_render_image)
+    {
+      if (preview_fast_gen != preview_render_gen
+          || SDL_GetTicks () - preview_fast_stamp >= 100)
+        preview_refresh_fast ();
+
+      return preview_fast_image;
+    }
+
   bool have_result = false;
 
   pthread_mutex_lock (&preview_mutex);
+
   if (preview_result_ready)
     {
       image_copy (preview_job_dst, s.image);
@@ -983,22 +1024,10 @@ preview_display_image (void)
       || !preview_fast_image || !preview_render_image)
     return s.image;
 
-  // Throttle: doing a full-screen bilinear pass on every display tick costs
-  // more CPU than the render itself at deep zoom.  4 Hz is enough for a live
-  // progress indicator.
-  const u32 now = SDL_GetTicks ();
-  if (now - preview_fast_stamp >= 250)
-    {
-      for (i32 y = 0; y < s.h; ++y)
-        for (i32 x = 0; x < s.w; ++x)
-          {
-            const f64 sx = ((f64) x + 0.5) * (f64) render_w / (f64) s.w - 0.5;
-            const f64 sy = ((f64) y + 0.5) * (f64) render_h / (f64) s.h - 0.5;
-            image_set2 (preview_fast_image, x, y,
-                        bilinear_sample (preview_render_image, sx, sy));
-          }
-      preview_fast_stamp = now;
-    }
+  // Stopgap before the very first neural result.
+  if (preview_fast_gen != preview_render_gen
+      || SDL_GetTicks () - preview_fast_stamp >= 250)
+    preview_refresh_fast ();
 
   return preview_fast_image;
 }
@@ -3237,8 +3266,10 @@ main (i32 argc, char **argv)
           // background GPU job is in flight: terminating then would block on
           // it.  A completed GPU frame is adopted here, at a commit boundary,
           // so the accumulated zoom baked into the scene is small and the
-          // view does not jump.
+          // view does not jump.  Preview mode has no GPU path and lets the
+          // render completion drive the commit, so skip the timer there.
           if (vibe_counter % 15 == 0
+              && !preview_active ()
               && !gpu_job_active && !gpu_vibe_inflight)
             {
               terminate ();
@@ -3479,13 +3510,11 @@ main (i32 argc, char **argv)
                 s.mouse_cy = my;
               }
 
-              // Clear the buffer the render workers actually write to.  In
-              // preview mode that is the half-res buffer; leaving it uncleared
-              // kept stale pixels from previous vibe frames (ghosting).
-              // s.image holds the last neural frame and must stay intact.
-              if (preview_active () && preview_div > 1)
-                image_fill (preview_render_image, color_argb (0, 0, 0, 0));
-              else if (!preview_final_valid)
+              // s.image holds the last neural frame and must stay intact in
+              // preview mode.  The half-res buffer is not cleared here: during
+              // vibe it is the frame currently on screen, so clearing it would
+              // flash an empty image at every commit.
+              if (!preview_final_valid)
                 image_fill (s.image, color_argb (0, 0, 0, 0));
 
               atomic_store (&s.tiles_done, 0);
@@ -3897,7 +3926,7 @@ main (i32 argc, char **argv)
 
       if (vibe_upload_ok)
         {
-          struct image *shown = preview_display_image ();
+          struct image *shown = preview_display_image (vibe);
 
           // Upload texture (atomic per-pixel read, safe for partial frames).
           {
