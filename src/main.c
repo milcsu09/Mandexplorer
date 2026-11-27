@@ -190,6 +190,11 @@ static bool vibe = false;
 static usize *render_counts = NULL;
 static usize render_counts_cap = 0;
 
+// Approximate radius of the expanding CPU-render circle.  Workers walk
+// render_pixels in stride order, so the number of finished work items is also
+// the length of the rendered prefix when sorted by distance from the mouse.
+static _Atomic usize render_items_done;
+
 
 // Probe snapshot.  It is filled when a render starts and is only read by the
 // probe job after that render has finished.
@@ -2338,6 +2343,8 @@ worker (void *argument)
           }
 
       image_set2 (target, x, y, color_rgb (r / samples, g / samples, b / samples));
+
+      atomic_fetch_add (&render_items_done, 1);
     }
 
   atomic_fetch_add (&s.tiles_done, 1);
@@ -4131,6 +4138,8 @@ main (i32 argc, char **argv)
                                 render_pixels[render_counts[r2]].r2 = (f64)r2;
                                 render_counts[r2]++;
                               }
+
+                          atomic_store (&render_items_done, 0);
                         }
                     }
                 }
@@ -4380,9 +4389,7 @@ main (i32 argc, char **argv)
       // to upload and show the expanding circle of progress.)
       const bool gpu_busy = atomic_load (&gpu_job_active);
 
-      const bool vibe_upload_ok = !gpu_busy && !canvas_frozen;
-
-      if (vibe_upload_ok)
+      if (!gpu_busy)
         {
           struct image *shown = preview_display_image ();
 
@@ -4405,7 +4412,44 @@ main (i32 argc, char **argv)
           }
 
           SDL_SetRenderTarget (s.renderer, s.texture_canvas);
-          SDL_RenderCopy (s.renderer, s.texture, NULL, NULL);
+
+          if (canvas_frozen && vibe && render_pixel_count > 0)
+            {
+              // The rebased canvas holds the previous frame already warped
+              // into the new scene.  Paste the in-flight render on top only
+              // inside the finished circle: that keeps the circle visible
+              // without letting stale pixels overwrite the baked transform.
+              const usize done = atomic_load (&render_items_done);
+              const usize idx = done < render_pixel_count ? done
+                                                         : render_pixel_count - 1;
+
+              if (idx > 0)
+                {
+                  const f64 div = (preview_active () && preview_div > 1)
+                                  ? (f64) preview_div : 1.0;
+                  const f64 radius = sqrt (render_pixels[idx].r2) * div;
+                  const i32 cx = s.mouse_cx;
+                  const i32 cy = s.mouse_cy;
+                  const i32 step = imax (1, (i32) (radius / 8.0));
+
+                  for (i32 dy = -radius; dy <= radius; dy += step)
+                    {
+                      const f64 hh = sqrt (radius * radius - (f64) dy * (f64) dy);
+                      const i32 half = (i32) hh;
+
+                      if (half <= 0)
+                        continue;
+
+                      SDL_Rect clip = { cx - half, cy + dy, 2 * half, step + 1 };
+                      SDL_RenderSetClipRect (s.renderer, &clip);
+                      SDL_RenderCopy (s.renderer, s.texture, NULL, NULL);
+                    }
+
+                  SDL_RenderSetClipRect (s.renderer, NULL);
+                }
+            }
+          else
+            SDL_RenderCopy (s.renderer, s.texture, NULL, NULL);
         }
 
       SDL_SetRenderTarget (s.renderer, NULL);
