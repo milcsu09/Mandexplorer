@@ -33,9 +33,12 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   match the SDL `vr` transform (no Goose half-pixel offset).
 - `canvas_frozen` is set when the SDL texture transform is baked into
   `texture_canvas` at a rebase and cleared when the next full frame is ready.
-  While frozen the stale `s.image` is **not** uploaded (otherwise it overwrites
-  the baked pixels and the view snaps back by the accumulated zoom). Vibe
-  always shows the live bilinear half-res stream, never the late neural result.
+  While frozen the stale `s.image` is not pasted over the whole canvas (that
+  overwrites the baked pixels and snaps the view back by the accumulated zoom).
+  It is uploaded, but composited only inside the growing render circle
+  (horizontal clip slices, radius from `render_items_done`), so the expanding
+  circle stays visible. Vibe always shows the live bilinear half-res stream,
+  never the late neural result.
 - `gpu_job_active` suppresses texture uploads while a GPU frame is being written.
 - `orbit_ready` stays true after a render, so queueing `compute_orbit` must
   clear it first; otherwise the next tick starts render workers while
