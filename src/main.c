@@ -247,6 +247,7 @@ static struct orbit_cache orbit_cache;
 static struct orbit reference_orbit;
 static struct bla_table bla_table;
 static struct pa_table pa_table;
+static struct mpa_table mpa_table;
 
 // Neural preview: render at half resolution, upscale with FSRCNN for display.
 // s.image stays full-size (UI, video, texture); preview_render_image is the
@@ -291,6 +292,15 @@ static bool orbit_flat_allowed = true;
 static bool pa_enabled = false;
 static f64 pa_epsilon = 9.313225746154785e-10; // 2^-30
 static _Atomic u64 pa_skips_applied;
+
+// Stage 4: multi-periodic approximation.  Opt-in until it is validated, and
+// tried before the naive PA table because one period can cover far more.
+static bool mpa_enabled = false;
+// 2^-46 keeps the first-order MPA error below the visual threshold on the
+// boundary regression scene while still allowing long skips; loosen it with
+// MANDEX_MPA_EPS for speed at the cost of approximation error.
+static f64 mpa_epsilon = 1.4210854715202004e-14; // 2^-46
+static _Atomic u64 mpa_skips_applied;
 
 static struct image *keyframe_image = NULL;
 static struct view_state keyframe_view;
@@ -1442,6 +1452,31 @@ compute_orbit (void *argument)
   else
     bla_clear (&bla_table);
 
+  if (mpa_enabled && s.scene->width <= 1e-12)
+    {
+      const f64 shift = hypot (delta_c_re, delta_c_im);
+
+      if (mpa_build (&mpa_table, &reference_orbit,
+                     s.scene->width * 0.75 + shift, mpa_epsilon))
+        {
+          if (getenv ("MANDEX_MPA_SELFTEST"))
+            mpa_selftest (&mpa_table, &reference_orbit, s.scene->width);
+
+          if (getenv ("MANDEX_MPA_STATS"))
+            fprintf (stderr,
+                     "MPA: %zu levels, %zu entries, longest period %llu,"
+                     " master %llu, eps 2^-%.0f\n",
+                     mpa_table.levels, mpa_table.table_len,
+                     (unsigned long long) mpa_table.periods[mpa_table.levels - 1],
+                     (unsigned long long) mpa_table.periods[0],
+                     -log2 (mpa_epsilon));
+        }
+      else
+        mpa_clear (&mpa_table);
+    }
+  else
+    mpa_clear (&mpa_table);
+
   atomic_store (&s.orbit_ready, true);
 }
 
@@ -2037,6 +2072,60 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
 
       u64 span = 0;
 
+      // Stage 4: multi-periodic approximation.  One entry can cover a whole
+      // period (far longer than BLA's dyadic span), so it is tried first.
+      if (mpa_table.valid)
+        {
+          f64 pe_re, pe_im, pd_re, pd_im;
+
+          if (mpa_try_skip (&mpa_table, iter_orbit,
+                            epsilon_re, epsilon_im,
+                            deriv_re, deriv_im,
+                            delta_re, delta_im,
+                            &pe_re, &pe_im, &pd_re, &pd_im, &span)
+              && span > 0 && iter + span <= s.scene->iter_max
+              && iter_orbit + span <= s.scene->iter_max)
+            {
+              epsilon_re = pe_re;
+              epsilon_im = pe_im;
+              deriv_re = pd_re;
+              deriv_im = pd_im;
+              atomic_fetch_add (&mpa_skips_applied, 1);
+              iter += span;
+              iter_orbit += span;
+
+              f64 rr, ri;
+
+              if (!orbit_at (&reference_orbit, iter_orbit, &rr, &ri))
+                return 0.0;
+
+              const f64 zr = rr + epsilon_re;
+              const f64 zi = ri + epsilon_im;
+              const f64 z2 = zr * zr + zi * zi;
+
+              if (z2 > bailout2)
+                {
+                  const f64 a = zr * deriv_re + zi * deriv_im;
+                  const f64 bb = zi * deriv_re - zr * deriv_im;
+                  const f64 len = hypot (a, bb);
+
+                  if (nx) *nx = len > 0.0 ? a / len : 0.0;
+                  if (ny) *ny = len > 0.0 ? bb / len : 0.0;
+
+                  return fmax (0.0, iter + 1 - log (log (z2) * 0.5) / F64_LN2);
+                }
+
+              if (epsilon_re * epsilon_re + epsilon_im * epsilon_im > z2 / 2.0)
+                {
+                  epsilon_re = zr;
+                  epsilon_im = zi;
+                  iter_orbit = 0;
+                }
+
+              continue;
+            }
+        }
+
       // Stage 3: first-order PA skips from the reference start.  It is tried
       // before BLA because a single period can cover far more than 32 steps.
       if (pa_table.valid)
@@ -2529,6 +2618,17 @@ main (i32 argc, char **argv)
 
       if (bits >= 8 && bits <= 60)
         pa_epsilon = exp2 (-(f64) bits);
+    }
+
+  if (getenv ("MANDEX_MPA"))
+    mpa_enabled = true;
+
+  if (getenv ("MANDEX_MPA_EPS"))
+    {
+      const long bits = strtol (getenv ("MANDEX_MPA_EPS"), NULL, 10);
+
+      if (bits >= 8 && bits <= 60)
+        mpa_epsilon = exp2 (-(f64) bits);
     }
 
   dump_prefix = getenv ("MANDEX_DUMP");
@@ -3110,6 +3210,7 @@ main (i32 argc, char **argv)
 
   orbit_init (&reference_orbit);
   pa_init (&pa_table);
+  mpa_init (&mpa_table);
 
   s.ss = 1;
 
@@ -4021,6 +4122,13 @@ main (i32 argc, char **argv)
                                + hypot (delta_c_re, delta_c_im),
                                bla_margin);
 
+                  // The MPA radius guard was built for the old dc_max.  A
+                  // changed centre would make it permissive, so drop the table;
+                  // the next full render rebuilds it.
+                  if (vibe && mpa_enabled
+                      && (delta_c_re != 0.0 || delta_c_im != 0.0))
+                    mpa_clear (&mpa_table);
+
                   atomic_store (&s.orbit_ready, true);
                 }
               else
@@ -4614,6 +4722,7 @@ main (i32 argc, char **argv)
   mpfr_clears (orbit_cache.c_re, orbit_cache.c_im, (mpfr_ptr)NULL);
   orbit_clear (&reference_orbit);
   pa_clear (&pa_table);
+  mpa_clear (&mpa_table);
 
   if (keyframe_image)
     image_destroy (keyframe_image);
@@ -4650,6 +4759,10 @@ main (i32 argc, char **argv)
   if (getenv ("MANDEX_PA_STATS"))
     fprintf (stderr, "PA: %llu skips applied\n",
              (unsigned long long) atomic_load (&pa_skips_applied));
+
+  if (getenv ("MANDEX_MPA_STATS"))
+    fprintf (stderr, "MPA: %llu skips applied\n",
+             (unsigned long long) atomic_load (&mpa_skips_applied));
 
   printf ("Goodbye.\n");
 

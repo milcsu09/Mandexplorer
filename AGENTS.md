@@ -100,6 +100,30 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
   table is O(entries × skip) (capped at `PA_MAX_ENTRIES` 8192). It stays
   default-off groundwork until stage 4's hierarchical MPA table replaces it.
 
+## Multi-periodic approximation (stage 4)
+- `src/pa.c` now also hosts RFF's uncompressed MPA: levels built from the
+  record-minimum period candidates (`orbit->periods`), artificial periods
+  inserted so neighbours differ by at most `MPA_MAX_MULT^2`, mixed-radix
+  `skippable`/`elements` counts, and a closed-form `iteration -> table offset`
+  mapper. Table memory is O(levels × periods), not O(N).
+- `mpa_build()` walks the reference up to the last period candidate, with the
+  same amortized merge loop as RFF's `uGenerateTable` (single-threaded); the
+  mapper is recomputed instead of stored, so no per-iteration array is needed.
+  `MANDEX_MPA_MAPCHECK=1` verifies it against RFF's running layout.
+- Runtime `mpa_try_skip()` runs before PA/BLA in the pixel loop and applies the
+  longest guard-valid entry. `radius == -INFINITY` is the "invalid entry"
+  sentinel in log2 space (unlike the naive PA, which uses `0`).
+- Opt-in: `MANDEX_MPA=1`, `MANDEX_MPA_EPS=N` (bits, default 46),
+  `MANDEX_MPA_STATS=1`, `MANDEX_MPA_SELFTEST=1` (compares every readable entry
+  with exact quadratic perturbation; worst relative error ~1e-10).
+- Validation: deep scene `20261126_071203.sce` is byte-identical to BLA
+  (`96ac31...`) and ~6× faster (12 s vs 78 s at 64×48); the boundary test scene
+  at 1e-14 differs in <0.1% of pixels at 2^-46. Default-off until the deep
+  representation (stage 5) and reference rebasing (stage 6) land.
+- `MANDEX_MPA` with `MANDEX_BLA=0` also works on some scenes, but BLA acts as a
+  bootstrap on others (BLA moves the perturbation to a phase where MPA entries
+  become valid), so keep both enabled for now.
+
 ## Iteration ceiling
 - `MAX_ITER_MAX` is **33554432** (2^25, was 2^24). It is a hard clamp in
   `apply_iter_max()`, the adaptive controller and the reverse-video generator;

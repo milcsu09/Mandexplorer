@@ -61,4 +61,62 @@ bool pa_try_skip (const struct pa_table *t, u64 iter_orbit,
                   f64 *new_deriv_re, f64 *new_deriv_im,
                   u64 *skip);
 
+
+// Stage 4: multi-periodic approximation (RFF MB2MPAGenerator, uncompressed
+// path).  The table is built from the record-minima period candidates already
+// collected by the orbit.  Levels are exponential (each within MPA_MAX_MULT of
+// the next, real periods plus artificial ones), and a closed-form mixed-radix
+// mapper (iteration -> table offset) is used both while building and at render
+// time.  The table therefore costs O(levels x periods) memory instead of the
+// O(N) of the naive PA table or BLA.
+
+#define MPA_MAX_LEVELS 64
+#define MPA_MAX_MULT 2
+#define MPA_MIN_SKIP 4
+#define MPA_PERTURB_REQ 2
+#define MPA_MAX_TABLE (1u << 22)
+
+struct mpa_entry
+{
+  u64 skip;
+  struct pa_z an;
+  struct pa_z bn;
+  f64 radius;      // log2 bound on |eps|
+};
+
+struct mpa_table
+{
+  u64 *periods;        // one period per level
+  bool *artificial;    // level is an inserted (non-reference) period
+  u64 *skippable;      // iterations covered within one period of this level
+  u64 *elements;       // cumulative table entry count through this level
+  usize levels;
+  struct mpa_entry *table;
+  usize table_len;
+  f64 epsilon;
+  bool valid;
+};
+
+void mpa_init (struct mpa_table *t);
+void mpa_clear (struct mpa_table *t);
+
+// `dc_max` must bound |dc| over the whole image (same value BLA is built with).
+bool mpa_build (struct mpa_table *t, struct orbit *o, f64 dc_max,
+                f64 epsilon);
+
+// Runtime lookup.  Only usable when `ref_iter` lands on a mixed-radix boundary;
+// returns the longest guard-valid skip from `ref_iter`, updating eps and deriv.
+bool mpa_try_skip (const struct mpa_table *t, u64 ref_iter,
+                   f64 eps_re, f64 eps_im, f64 deriv_re, f64 deriv_im,
+                   f64 dc_re, f64 dc_im,
+                   f64 *new_eps_re, f64 *new_eps_im,
+                   f64 *new_deriv_re, f64 *new_deriv_im,
+                   u64 *skip);
+
+usize mpa_level_count (const struct mpa_table *t);
+
+// Debug: compare each readable table entry against the exact quadratic
+// perturbation over the same reference range.  Prints the worst error.
+void mpa_selftest (const struct mpa_table *t, struct orbit *o, f64 dc);
+
 #endif // PA_H
