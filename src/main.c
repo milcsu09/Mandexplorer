@@ -14,6 +14,7 @@
 #include "color.h"
 #include "common.h"
 #include "config.h"
+#include "deep.h"
 #include "image.h"
 #include "orbit.h"
 #include "pa.h"
@@ -302,6 +303,13 @@ static bool mpa_enabled = false;
 static f64 mpa_epsilon = 1.4210854715202004e-14; // 2^-46
 static _Atomic u64 mpa_skips_applied;
 
+// Stage 5: force the extended-exponent perturbation loop even on a scene whose
+// width still fits f64.  Used to A/B the deep arithmetic against the exact
+// MPFR ground truth on a shallow but detailed scene.
+static bool deep_force = false;
+
+static void deep_check_run (void);
+
 static struct image *keyframe_image = NULL;
 static struct view_state keyframe_view;
 static bool has_keyframe = false;
@@ -456,6 +464,10 @@ static char video_path[256] = { 0 };
 static const char *dump_prefix = NULL;
 static usize dump_limit = 0;
 static usize dump_count = 0;
+// Dump the first complete interactive render and exit.  Used to test the
+// renderer headlessly (SDL dummy driver) without the video pipeline.
+static bool dump_once = false;
+static bool dump_once_done = false;
 static usize auto_frames = 0;
 
 
@@ -1348,12 +1360,12 @@ apply_iter_max (u64 iter_max)
 static mpfr_prec_t
 orbit_precision (void)
 {
-  const f64 width = s.scene->width;
+  const f64 lw = scene_log2_width (s.scene);
 
-  if (!(width > 0.0) || !isfinite (width))
+  if (!isfinite (lw))
     return FLOAT_PREC;
 
-  f64 bits = -log2 (width) + log2 ((f64) s.scene->iter_max) + 64.0;
+  f64 bits = -lw + log2 ((f64) s.scene->iter_max) + 64.0;
 
   if (bits < 160.0)
     bits = 160.0;
@@ -1405,7 +1417,7 @@ compute_orbit (void *argument)
         return;
     }
 
-  if (pa_enabled)
+  if (pa_enabled && !scene_is_deep (s.scene))
     {
       if (!pa_build (&pa_table, &reference_orbit, s.scene->width, pa_epsilon))
         pa_clear (&pa_table);
@@ -1443,7 +1455,12 @@ compute_orbit (void *argument)
 
   // At shallow depths the skipped fraction is too small to pay for the
   // extended-exponent polynomial, so only engage BLA for real deep zooms.
-  if (bla_enabled && s.scene->width <= 1e-12)
+  // Deep scenes (stage 5 width representation) are excluded for now: their
+  // |dc| bound is far below f64, so bla/mpa/pa would be built with a useless
+  // radius.  The deep perturbation path handles them without skips.
+  const bool deep = scene_is_deep (s.scene);
+
+  if (!deep && bla_enabled && s.scene->width <= 1e-12)
     {
       const f64 shift = hypot (delta_c_re, delta_c_im);
       bla_build (&bla_table, &reference_orbit, s.scene->iter_max,
@@ -1452,7 +1469,7 @@ compute_orbit (void *argument)
   else
     bla_clear (&bla_table);
 
-  if (mpa_enabled && s.scene->width <= 1e-12)
+  if (!deep && mpa_enabled && s.scene->width <= 1e-12)
     {
       const f64 shift = hypot (delta_c_re, delta_c_im);
 
@@ -1476,6 +1493,9 @@ compute_orbit (void *argument)
     }
   else
     mpa_clear (&mpa_table);
+
+  if (getenv ("MANDEX_DEEP_CHECK"))
+    deep_check_run ();
 
   atomic_store (&s.orbit_ready, true);
 }
@@ -2322,6 +2342,267 @@ mandelbrot (f64 delta_re, f64 delta_im, f64 *restrict nx, f64 *restrict ny)
 }
 
 
+// Stage 5: perturbation loop for views beyond the f64 range.  Same recurrences
+// as mandelbrot(), but the pixel offset, the travelling perturbation and the
+// derivative use the extended-exponent complex (`struct dcx`) so |dc| ~ 1e-400
+// neither underflows nor collapses to zero.  The reference orbit stays f64
+// because its values are O(1) near the boundary.
+//
+// No BLA/MPA/PA skips here yet: their radius guards are built from a f64 dc
+// bound, which is exactly what this stage replaces.  The plain recurrence is
+// correct (and is the reference the skip tables are checked against).
+f64
+mandelbrot_deep (struct dcx dc, f64 *restrict nx, f64 *restrict ny)
+{
+  u64 iter = 0;
+  u64 iter_orbit = 0;
+
+  struct dcx eps = { 0.0, 0.0, 0 };
+  struct dcx deriv = { 0.0, 0.0, 0 };
+
+  struct dcx saved = { 0.0, 0.0, 0 };
+  bool have_saved = false;
+  u64 period = 1;
+
+  const f64 log2_bailout2 = 2.0 * log2 (s.scene->bailout);
+  const bool check_period = period_tol > 1e-61;
+  const f64 log2_tol = check_period ? log2 (period_tol) : 0.0;
+
+  while (iter < s.scene->iter_max)
+    {
+      if (s.work_generation != atomic_load (&s.generation))
+        return 0.0;
+
+      f64 rr, ri;
+
+      if (!orbit_at (&reference_orbit, iter_orbit, &rr, &ri))
+        return 0.0;
+
+      // z_n = Z_n + eps_n
+      const struct dcx z = dcx_add_d (eps, rr, ri);
+
+      // D_{n+1} = 2 * z_n * D_n + 1
+      deriv = dcx_add_d (dcx_scale2 (dcx_mul (z, deriv)), 1.0, 0.0);
+
+      // eps_{n+1} = 2*Z_n*eps_n + eps_n^2 + dc
+      const struct dcx lin = dcx_mul_d (eps, 2.0 * rr, 2.0 * ri);
+      const struct dcx quad = dcx_mul (eps, eps);
+
+      eps = dcx_add (dcx_add (lin, quad), dc);
+
+      if (!orbit_at (&reference_orbit, iter_orbit + 1, &rr, &ri))
+        return 0.0;
+
+      const struct dcx z1 = dcx_add_d (eps, rr, ri);
+      const f64 lz = dcx_log2_abs (z1);   // log2 |z|, -INF if z == 0
+
+      // Period (cycle) detection, compared in log space so neither |z|^2 nor
+      // |z - saved|^2 needs an f64 value.
+      if (check_period && have_saved)
+        {
+          const struct dcx d = dcx_sub (z1, saved);
+
+          if (dcx_is_zero (d))
+            {
+              if (nx) *nx = 0.0;
+              if (ny) *ny = 0.0;
+              return s.scene->iter_max;
+            }
+
+          const f64 ld = dcx_log2_abs (d);
+          const f64 log2_z2 = 2.0 * lz;
+
+          // log2 (1 + |z|^2)
+          const f64 log2_one_plus =
+            log2_z2 > 0.0 ? log2_z2 + log2 (1.0 + exp2 (-log2_z2))
+                          : log2 (1.0 + exp2 (log2_z2));
+
+          if (2.0 * ld < log2_tol + log2_one_plus)
+            {
+              if (nx) *nx = 0.0;
+              if (ny) *ny = 0.0;
+              return s.scene->iter_max;
+            }
+        }
+
+      if (iter + 1 == period)
+        {
+          saved = z1;
+          have_saved = true;
+          period *= 2;
+          if (period > s.scene->iter_max) period = s.scene->iter_max;
+        }
+
+      if (2.0 * lz > log2_bailout2)
+        {
+          // Gradient direction is the phase of z * conj(D), matching the f64
+          // path's `a = Re(z*conj D)`, `b = Im(z*conj D)`.  The common 2^e
+          // factor cancels in the normalisation.
+          const struct dcx p = dcx_mul (z1, dcx_conj (deriv));
+          const f64 len = hypot (p.x, p.y);
+
+          if (nx) *nx = len > 0.0 ? p.x / len : 0.0;
+          if (ny) *ny = len > 0.0 ? p.y / len : 0.0;
+
+          const f64 lnz = lz * F64_LN2;   // natural log of |z|
+
+          return fmax (0.0, (f64) (iter + 1) - log (lnz) / F64_LN2);
+        }
+
+      iter++;
+      iter_orbit++;
+
+      // Rebase when the perturbation is no longer small:
+      // |eps|^2 > |z|^2 / 2  <=>  2*log2|eps| > 2*log2|z| - 1.
+      if (2.0 * dcx_log2_abs (eps) > 2.0 * lz - 1.0)
+        {
+          eps = z1;
+          iter_orbit = 0;
+        }
+    }
+
+  if (nx)
+    *nx = 0.0;
+
+  if (ny)
+    *ny = 0.0;
+
+  return s.scene->iter_max;
+}
+
+
+// Debug: compare mandelbrot_deep() against a naive exact MPFR orbit on a small
+// pixel grid.  The ground truth starts from z = 0 and iterates at higher
+// precision than the reference, so it is independent of the perturbation path.
+// MANDEX_DEEP_CHECK=1 runs it once after the reference orbit is built.
+static void
+deep_check_run (void)
+{
+  if (render_w <= 0 || render_h <= 0)
+    return;
+
+  const struct dxr ws = scene_is_deep (s.scene)
+                          ? dxr_set (s.scene->width, s.scene->width_exp)
+                          : dxr_from_d (s.scene->width);
+  const struct dxr pix = dxr_div (ws, dxr_from_d ((f64) render_w));
+
+  mpfr_prec_t prec = orbit_precision () + 128;
+
+  if (prec > FLOAT_PREC)
+    prec = FLOAT_PREC;
+
+  mpfr_t cr, ci, zr, zi, nr, ni, b2, d;
+  mpfr_inits2 (prec, cr, ci, zr, zi, nr, ni, b2, d, (mpfr_ptr) NULL);
+
+  mpfr_set_d (b2, s.scene->bailout, MPFR_RNDN);
+  mpfr_sqr (b2, b2, MPFR_RNDN);
+
+  s.work_generation = atomic_load (&s.generation);
+
+  int samples = 0, both_in = 0, both_out = 0, mismatch = 0;
+  long maxdiff = 0;
+  f64 max_nu_f = 0.0;
+  f64 max_dir = 0.0;
+  int dir_bad = 0;
+
+  for (int gy = 0; gy < 4; ++gy)
+    for (int gx = 0; gx < 4; ++gx)
+      {
+        const i32 x = (i32) ((gx + 0.5) * 0.25 * (f64) render_w);
+        const i32 y = (i32) ((gy + 0.5) * 0.25 * (f64) render_h);
+        const f64 fx = x - render_w / 2.0 + 0.5;
+        const f64 fy = render_h / 2.0 - y - 0.5;
+        const struct dcx dc = dcx_norm (pix.m * fx, pix.m * fy, pix.e);
+
+        f64 dnx, dny;
+        f64 fnx, fny;
+        const f64 nu = mandelbrot_deep (dc, &dnx, &dny);
+        const f64 nu_f = mandelbrot (dcx_re (dc), dcx_im (dc), &fnx, &fny);
+
+        mpfr_set_d (d, dc.x, MPFR_RNDN);
+        mpfr_mul_2si (d, d, dc.e, MPFR_RNDN);
+        mpfr_add (cr, s.scene->c_re, d, MPFR_RNDN);
+        mpfr_set_d (d, dc.y, MPFR_RNDN);
+        mpfr_mul_2si (d, d, dc.e, MPFR_RNDN);
+        mpfr_add (ci, s.scene->c_im, d, MPFR_RNDN);
+
+        mpfr_set_zero (zr, 0);
+        mpfr_set_zero (zi, 0);
+
+        u64 n = 0;
+        bool escaped = false;
+
+        while (n < s.scene->iter_max)
+          {
+            mpfr_sqr (nr, zr, MPFR_RNDN);
+            mpfr_sqr (ni, zi, MPFR_RNDN);
+            mpfr_sub (nr, nr, ni, MPFR_RNDN);
+            mpfr_add (nr, nr, cr, MPFR_RNDN);
+
+            mpfr_mul (ni, zr, zi, MPFR_RNDN);
+            mpfr_mul_2ui (ni, ni, 1, MPFR_RNDN);
+            mpfr_add (ni, ni, ci, MPFR_RNDN);
+
+            mpfr_set (zr, nr, MPFR_RNDN);
+            mpfr_set (zi, ni, MPFR_RNDN);
+            ++n;
+
+            mpfr_sqr (nr, zr, MPFR_RNDN);
+            mpfr_sqr (ni, zi, MPFR_RNDN);
+            mpfr_add (nr, nr, ni, MPFR_RNDN);
+
+            if (mpfr_cmp (nr, b2) > 0)
+              {
+                escaped = true;
+                break;
+              }
+          }
+
+        const bool deep_in = nu >= (f64) s.scene->iter_max;
+
+        ++samples;
+
+        if (escaped == deep_in)
+          ++mismatch;
+        else if (!escaped)
+          ++both_in;
+        else
+          {
+            ++both_out;
+
+            const long diff = labs ((long) floor (nu) - (long) n);
+
+            if (diff > maxdiff)
+              maxdiff = diff;
+
+            if (nu_f < (f64) s.scene->iter_max)
+              {
+                const f64 df = fabs (nu - nu_f);
+
+                if (df > max_nu_f)
+                  max_nu_f = df;
+
+                const f64 ddir = fabs (dnx - fnx) + fabs (dny - fny);
+
+                if (ddir > max_dir)
+                  max_dir = ddir;
+                if (ddir > 0.2)
+                  ++dir_bad;
+              }
+          }
+      }
+
+  fprintf (stderr,
+           "deep-check: %d samples, both-in %d, both-out %d, mismatch %d,"
+           " max |iter diff| %ld, max |nu deep-f64| %.3f,"
+           " max dir diff %.3f (%d bad)\n",
+           samples, both_in, both_out, mismatch, maxdiff, max_nu_f,
+           max_dir, dir_bad);
+
+  mpfr_clears (cr, ci, zr, zi, nr, ni, b2, d, (mpfr_ptr) NULL);
+}
+
+
 u32
 mandelbrot_color (f64 nu)
 {
@@ -2376,7 +2657,15 @@ worker (void *argument)
   const f64 sample = 1.0 / s.render_ss;
   const i32 samples = s.render_ss * s.render_ss;
 
+  const bool deep = scene_is_deep (s.scene) || deep_force;
   const f64 scale = s.scene->width / (f64) render_w;
+
+  // Deep path: pixel size as an extended-range real, width * 2^exp / render_w.
+  const struct dxr deep_scale =
+    dxr_div (dxr_set (s.scene->width, s.scene->width_exp),
+             dxr_from_d ((f64) render_w));
+
+  const bool inside_color = color_inside && (deep || s.scene->width <= 1e-3);
 
   struct image *target =
     (preview_active () && preview_div > 1) ? preview_render_image : s.image;
@@ -2404,15 +2693,29 @@ worker (void *argument)
             if (s.work_generation != atomic_load (&s.generation))
               return;
 
-            const f64 dx = (x - render_w / 2.0 + (sx + 0.5) * sample) * scale;
-            const f64 dy = (render_h / 2.0 - y - (sy + 0.5) * sample) * scale;
+            const f64 fx = x - render_w / 2.0 + (sx + 0.5) * sample;
+            const f64 fy = render_h / 2.0 - y - (sy + 0.5) * sample;
 
             f64 nx, ny;
-            f64 nu = mandelbrot (dx, dy, &nx, &ny);
+            f64 nu;
+
+            if (deep)
+              {
+                const struct dcx dc =
+                  dcx_norm (deep_scale.m * fx, deep_scale.m * fy,
+                            deep_scale.e);
+                nu = mandelbrot_deep (dc, &nx, &ny);
+              }
+            else
+              {
+                const f64 dx = fx * scale;
+                const f64 dy = fy * scale;
+                nu = mandelbrot (dx, dy, &nx, &ny);
+              }
 
             if (nu >= s.scene->iter_max)
               {
-                if (color_inside && s.scene->width <= 1e-3)
+                if (inside_color)
                   {
                     r += 24;
                     g += 20;
@@ -2631,6 +2934,9 @@ main (i32 argc, char **argv)
         mpa_epsilon = exp2 (-(f64) bits);
     }
 
+  if (getenv ("MANDEX_DEEP_FORCE"))
+    deep_force = true;
+
   dump_prefix = getenv ("MANDEX_DUMP");
 
   if (dump_prefix)
@@ -2639,6 +2945,9 @@ main (i32 argc, char **argv)
       const long v = limit_env ? strtol (limit_env, NULL, 10) : 8;
       dump_limit = v > 0 ? (usize) v : 8;
     }
+
+  if (getenv ("MANDEX_DUMP_ONCE"))
+    dump_once = true;
 
   struct opt_f64 width = { 0 };
 
@@ -3057,7 +3366,10 @@ main (i32 argc, char **argv)
     mpfr_set_str (s.scene->c_im, c_im, 10, MPFR_RNDN);
 
   if (width.has_value)
-    s.scene->width = width.value;
+    {
+      s.scene->width = width.value;
+      s.scene->width_exp = 0;
+    }
 
   if (bailout.has_value)
     s.scene->bailout = bailout.value;
@@ -3405,6 +3717,7 @@ main (i32 argc, char **argv)
                 terminate ();
 
                 s.scene->width = 8.0;
+                s.scene->width_exp = 0;
 
                 mpfr_set_d (s.scene->c_re, -0.75, MPFR_RNDN);
                 mpfr_set_d (s.scene->c_im, +0.00, MPFR_RNDN);
@@ -3954,6 +4267,7 @@ main (i32 argc, char **argv)
               s.scene->iter_per_color = v->iter_per_color;
               s.scene->bailout = v->bailout;
               s.scene->width = v->width;
+              s.scene->width_exp = 0;
 
               mpfr_set (s.scene->c_re, v->c_re_hi, MPFR_RNDN);
               mpfr_set (s.scene->c_im, v->c_im_hi, MPFR_RNDN);
@@ -4167,6 +4481,8 @@ main (i32 argc, char **argv)
               // GPU is free to accelerate the render.
               const bool use_gpu =
                 !vibe
+                && !scene_is_deep (s.scene)
+                && !deep_force
                 && gpu_is_available ()
                 && !preview_mode
                 && orbit_has_flat (&reference_orbit)
@@ -4368,6 +4684,17 @@ main (i32 argc, char **argv)
               vibe_rendering = false;
 
               preview_submit_job ();
+
+              // Headless single-frame mode: dump the completed render and
+              // stop.  Used to test the deep renderer under SDL's dummy driver
+              // without generating a video.
+              if (dump_once && !dump_once_done)
+                {
+                  dump_once_done = true;
+                  dump_ppm ();
+                  s.running = false;
+                  break;
+                }
 
               const bool can_probe = auto_iter
                                      && !vibe
@@ -4582,7 +4909,12 @@ main (i32 argc, char **argv)
 
           write_tl (y++, "C_re: %+.1e", mpfr_get_d (s.scene->c_re, MPFR_RNDN));
           write_tl (y++, "C_im: %+.1e", mpfr_get_d (s.scene->c_im, MPFR_RNDN));
-          write_tl (y++, "Width: %.1e", s.scene->width);
+
+          if (scene_is_deep (s.scene))
+            write_tl (y++, "Width: 1e%.2f",
+                      scene_log2_width (s.scene) * 0.30102999566398120);
+          else
+            write_tl (y++, "Width: %.1e", s.scene->width);
 
           y++;
 

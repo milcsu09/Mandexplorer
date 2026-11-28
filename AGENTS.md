@@ -8,7 +8,8 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 
 ## Source layout
 - `src/main.c` — event loop, rendering pipeline, period detection, UI overlay (Alt toggles info).
-- `src/scene.c`/`scene.h` — scene state, iter_max handling.
+- `src/scene.c`/`scene.h` — scene state, iter_max handling, extended-range width.
+- `src/deep.c`/`deep.h` — extended-exponent (mantissa + binary exponent) real and complex used by the deep perturbation path.
 - `src/color.c`, `src/image.c`, `src/palette.c`, `src/common.c`, `src/thread_pool.c`.
 
 ## Key bindings (see src/main.c)
@@ -123,6 +124,44 @@ C/SDL2 Mandelbrot explorer. Single binary built from `src/*.c`.
 - `MANDEX_MPA` with `MANDEX_BLA=0` also works on some scenes, but BLA acts as a
   bootstrap on others (BLA moves the perturbation to a phase where MPA entries
   become valid), so keep both enabled for now.
+
+## Deep representation (stage 5)
+- `src/scene.c` stores the view width as `width * 2^width_exp`. Shallow scenes
+  (the whole f64 range, `width_exp == 0`) keep the exact legacy `f64 width`, so
+  every existing path — including the pixel-identical regressions — is
+  unchanged. A width below ~1e-300 is parsed through MPFR (`mpfr_get_d_2exp`)
+  into a normalised mantissa in [0.5, 1) plus an `i32` exponent; saving goes
+  back through MPFR's `%Re`, which prints exponents far outside f64.
+- `src/deep.c`/`deep.h` provide `struct dxr` (real) and `struct dcx` (complex)
+  as mantissa `[0.5, 1) * 2^e` with a full-width exponent. They are the shared
+  generalisation of the extended-exponent types that `bla.c`/`pa.c` already
+  used internally.
+- `mandelbrot_deep()` mirrors the f64 perturbation loop but carries the pixel
+  offset `dc`, the travelling perturbation `eps` and the derivative `D` as
+  `struct dcx`, so a view at 1e-400 neither underflows nor collapses to zero.
+  The reference orbit stays f64 (its values are O(1)). Escape, smooth colour,
+  period detection and rebasing are all done in log space so no intermediate
+  needs an f64 magnitude. The gradient uses `z * conj(D)`, matching the f64
+  path's lighting.
+- The worker selects the deep path when `scene_is_deep()`. BLA/MPA/PA and the
+  GPU are disabled for deep scenes: their radius guards are built from an f64
+  `dc` bound, which is exactly what this stage replaces. Deep renders are
+  therefore exact but unskipped (no speed-up yet).
+- Validation: `MANDEX_DEEP_CHECK=1` compares `mandelbrot_deep()` with a naive
+  exact MPFR orbit on a 4x4 pixel grid. On the 1e-14 boundary scene it reports
+  16/16 escaped, 0 mismatches, max iteration delta 1 (smooth-colour alignment)
+  and `nu` within 0.45 of the f64 path. At 1e-400 it matches the exact orbit on
+  every sample (`mis3` centre escapes, `seahorse`/`real2` stay inside).
+  `MANDEX_DEEP_FORCE=1` runs the deep path on a shallow scene, which is how the
+  arithmetic is A/B tested against the f64 path.
+- Headless single-frame render: `MANDEX_DUMP_ONCE=1` (with `MANDEX_DUMP=dir/`)
+  writes the first completed interactive frame and exits, without the video
+  pipeline. Used to test deep scenes under `SDL_VIDEODRIVER=dummy`.
+- Not yet extended: recording, `--reverse-video` and interactive pan/zoom still
+  treat `width` as f64 (`struct view_state` keeps an f64 width), so deep scenes
+  should be rendered from a loaded `.sce`, not navigated or turned into a
+  video. That, the O(N) reference generation and the iteration ceiling remain
+  stage 6 (rebasing/skips).
 
 ## Iteration ceiling
 - `MAX_ITER_MAX` is **33554432** (2^25, was 2^24). It is a hard clamp in
